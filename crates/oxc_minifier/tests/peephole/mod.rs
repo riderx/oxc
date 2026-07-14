@@ -5,6 +5,7 @@ mod esbuild;
 mod fold_constants;
 mod inline;
 mod inline_single_use_variable;
+mod liveness_invariants;
 mod manual_pure_functions;
 mod merge_assignments_to_declarations;
 mod minimize_conditional_expression;
