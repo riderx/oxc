@@ -771,3 +771,31 @@ fn dce_remove_unreachable_after_terminating_statement() {
         "export function f(c) {\n\t{\n\t\tif (c) return g();\n\t\tfunction g() {\n\t\t\treturn 1;\n\t\t}\n\t}\n\treturn tail();\n}",
     );
 }
+
+// #13105: dead recursive/cyclic function declarations must also drop in
+// dce-only mode (rolldown's per-module treeshake preprocess). Declarator
+// and class cycles are KEPT — candidacy is functions-only (see the
+// `symbol_liveness` module doc) — and the keeps are pinned here under
+// dce's own options.
+#[test]
+fn dce_recursive_unused_functions() {
+    test("function f() { f() }", "");
+    test("function c() { d() } function d() { c() }", "");
+    // Cycle whose only external root sits in dead code: needs the mid-loop
+    // recompute trigger (pass 2), not just the initial compute.
+    test("if (false) c(); function c() { d() } function d() { c() }", "");
+    // Declarator and class cycles are kept (functions-only candidacy).
+    test_same("const a = () => b();\nconst b = () => a();");
+    test_same("class A {\n\tm() {\n\t\tnew B();\n\t}\n}\nclass B {\n\tm() {\n\t\tnew A();\n\t}\n}");
+    // Live references root the cycle.
+    test_same("function f() {\n\tf();\n}\nconsole.log(f);");
+    test_same("export function f() {\n\tf();\n}");
+    // The block unwrap relocates the declarator into the bare if-consequent
+    // slot mid-pass, where no removal site reaches it — the cycle must stay
+    // whole rather than lose `function a` to the stale dead set. Reachable
+    // here too: rolldown runs this mode on every treeshake build.
+    test(
+        "function a() { b() } function p1() {} function p2() { p1() } if (g) { p2(); p1(b); var b = a; }",
+        "function a() {\n\tb();\n}\nif (g) var b = a;",
+    );
+}

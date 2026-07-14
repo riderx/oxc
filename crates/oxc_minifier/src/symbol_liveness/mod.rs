@@ -40,14 +40,18 @@
 //! `remove_unused_declaration.rs` delete cleanly, with zero residue: a dead
 //! cycle is removed whole in one pass, and a blocked member would leave
 //! references to deleted peers (ReferenceError). The definitions are shared
-//! structurally so the two sides cannot drift:
+//! so the two sides cannot silently drift:
 //!
 //! - global gates: `can_remove_unused_declarators` delegates to
 //!   [`removal_enabled`] (`unused != Keep` plus the root
 //!   `ScopeFlags::DirectEval` skip — the flag propagates to the root from
 //!   any direct eval, subsuming per-site checks); the collection arms on
 //!   [`collection_enabled`], a strict SUBSET that adds the module-only
-//!   condition, so candidacy is only ever granted where removal is allowed;
+//!   condition, so candidacy is only ever granted where removal is allowed.
+//!   (`remove_unused_function_declaration` itself shares by argument, not
+//!   by delegation — its per-scope direct-eval check is deliberately finer
+//!   than the root flag; the contract sweep in `validate.rs` is the net if
+//!   the two ever disagree.)
 //! - function declarations always drop whole — there is no shape axis for
 //!   them, which is exactly why functions-only candidacy is cheap to keep
 //!   sound.
@@ -112,9 +116,7 @@
 //! Function-declaration sites have no other staleness axis: statement
 //! movers relocate whole function declarations between slots
 //! `exit_statement` visits either way, folds cannot change what a function
-//! declaration is, and substitution never rewrites one. (Declarator
-//! candidacy needed a relocation log, a substitution log, and a settled-
-//! shape gate for exactly these axes — that machinery left with it.)
+//! declaration is, and substitution never rewrites one.
 //!
 //! ## The oracle
 //!
@@ -149,7 +151,7 @@ use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx, generated::ance
 #[cfg(debug_assertions)]
 mod validate;
 #[cfg(debug_assertions)]
-pub use validate::compute_dead_symbols;
+pub use validate::{compute_dead_symbols, debug_assert_dead_declarations_removed};
 
 // ========================================================================
 // Shared predicates: the gate definitions (rules 1 and 2)
@@ -251,7 +253,8 @@ pub struct LivenessCollect<'a> {
     /// `(innermost enclosing candidate, referenced candidate-kind symbol)`.
     edges: ArenaVec<'a, (SymbolId, SymbolId)>,
     /// Saved `current_candidate` values; one frame per FUNCTION node,
-    /// pushed at enter, popped at exit.
+    /// pushed at enter, popped at exit. Only functions open regions —
+    /// classes and declarators just pin (their hooks push no frame).
     frames: ArenaVec<'a, Option<SymbolId>>,
     /// Innermost candidate whose deferred region the traversal is inside.
     current_candidate: Option<SymbolId>,
@@ -264,12 +267,9 @@ pub struct LivenessCollect<'a> {
     /// Rule 2 explains why rooting alone is not enough).
     pinned_next: BitSet<'a>,
     /// Symbols this pass's collection may have under-observed, force-rooted
-    /// at the flush. One producer: a bound reference minted behind the
-    /// traversal cursor (each minting pass logs at its call site —
-    /// `substitute_alternate_syntax`'s typeof rewrite is the only one
-    /// today, and the debug ground-truth validator flags an unlogged mint
-    /// across the whole corpus). An unlogged mint would otherwise publish a
-    /// live-referenced symbol as dead. Cleared every pass.
+    /// at the flush; see the module doc's Rule 3 for the one producer (a
+    /// bound reference minted behind the traversal cursor). Cleared every
+    /// pass.
     force_root_log: ArenaVec<'a, SymbolId>,
 }
 
@@ -416,8 +416,10 @@ fn parent_is_export(parent: Ancestor<'_, '_>) -> bool {
 /// `Traverse::enter_function` body: decide candidacy at the same position
 /// the removal site evaluates (the hook fires before the function's scope is
 /// entered, so `current_scope_id` is the containing scope — identical to the
-/// `exit_statement` frame that runs `remove_unused_function_declaration`).
-/// The only position failure a module can express is an export wrapper.
+/// `exit_statement` frame that runs `remove_unused_function_declaration`),
+/// and open the function's deferred region. The only position failure a
+/// module can express is an export wrapper: importers observe the binding,
+/// so it PINS instead of becoming a candidate.
 pub fn collect_enter_function<'a>(func: &Function<'a>, ctx: &mut TraverseCtx<'a>) {
     if !ctx.state.liveness.active {
         return;
@@ -580,40 +582,46 @@ pub fn propagate_collected<'a>(
 }
 
 /// Debug-only flush validation, before the swaps: the fresh sets are still
-/// in [`LivenessCollect`], the consumed sets still in `MinifierState`. Both
-/// nets sit behind the dead-set gate (their checks are vacuous when this
-/// pass marked nothing dead), so the whole test and conformance corpus
-/// doubles as a collection-vs-truth differ at zero release cost.
+/// in [`LivenessCollect`], the consumed sets still in `MinifierState`.
+/// Three nets, two of them behind the dead-set gate (their checks are
+/// vacuous when this pass marked nothing dead), so the whole test and
+/// conformance corpus doubles as a collection-vs-truth differ at zero
+/// release cost.
 #[cfg(debug_assertions)]
 fn validate_flush<'a>(program: &Program<'a>, ctx: &TraverseCtx<'a>) {
     let lv = &ctx.state.liveness;
-    if lv.dead_next.is_empty() {
-        return;
+    let scoping = ctx.scoping();
+    if !lv.dead_next.is_empty() {
+        let (walk_dead, walk_candidates, walk_pins) =
+            compute_dead_symbols(program, scoping, &ctx.state.options, ctx.allocator());
+        // Ground-truth net: everything the in-pass collection calls dead
+        // must be dead per a standalone walk of the settled tree — for
+        // symbols whose declarations still exist (a declaration removed
+        // this pass legitimately lingers in the stale set for one flush,
+        // with nothing left to remove).
+        for bit in lv.dead_next.ones() {
+            assert!(
+                !walk_candidates.contains(bit) || walk_dead.contains(bit),
+                "in-pass liveness collection marked symbol {bit} dead but the ground-truth walk \
+                 sees it live",
+            );
+        }
+        // Pin net: every pin the settled tree demands must have been
+        // collected. A missed pin is SILENT wrong code — the count arm
+        // deletes an observable binding while the dead set stays perfectly
+        // correct — so no dead-set check can catch it; this is the one
+        // direction the net above cannot see.
+        for bit in walk_pins.ones() {
+            assert!(
+                lv.pinned_next.contains(bit),
+                "collection failed to pin symbol {bit} (`{}`) that the ground-truth walk pins",
+                scoping.symbol_name(SymbolId::from_usize(bit)),
+            );
+        }
     }
-    let (walk_dead, walk_candidates, walk_pins) =
-        compute_dead_symbols(program, ctx.scoping(), &ctx.state.options, ctx.allocator());
-    // Ground-truth net: everything the in-pass collection calls dead must
-    // be dead per a standalone walk of the settled tree — for symbols
-    // whose declarations still exist (a declaration removed this pass
-    // legitimately lingers in the stale set for one flush, with nothing
-    // left to remove).
-    for bit in lv.dead_next.ones() {
-        assert!(
-            !walk_candidates.contains(bit) || walk_dead.contains(bit),
-            "in-pass liveness collection marked symbol {bit} dead but the ground-truth walk \
-             sees it live",
-        );
-    }
-    // Pin net: every pin the settled tree demands must have been
-    // collected. A missed pin is SILENT wrong code — the count arm deletes
-    // an observable binding while the dead set stays perfectly correct —
-    // so no dead-set check can catch it; this is the one direction the net
-    // above cannot see.
-    for bit in walk_pins.ones() {
-        assert!(
-            lv.pinned_next.contains(bit),
-            "collection failed to pin symbol {bit} (`{}`) that the ground-truth walk pins",
-            ctx.scoping().symbol_name(SymbolId::from_usize(bit)),
-        );
-    }
+    // The CONTRACT itself, on the settled tree: nothing this pass consumed
+    // as dead may still have a declaration standing. Unlike the walk above,
+    // this re-derives nothing, so it cannot inherit a wrong shared
+    // predicate.
+    debug_assert_dead_declarations_removed(program, scoping, &ctx.state.dead_symbols);
 }

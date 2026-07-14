@@ -1931,7 +1931,12 @@ impl<'a> PeepholeOptimizations {
                 let BindingPattern::BindingIdentifier(ident) = decl.id() else {
                     return false;
                 };
-                if !ctx.scoping().symbol_is_unused(ident.symbol_id()) {
+                // The shared predicate, not a raw count: a pinned binding
+                // (e.g. the sibling of an `export var f;`) reaches count
+                // zero when a dead cycle's removal discards its references,
+                // and without the pin veto the IIFE arms above would
+                // collapse an exported initializer to `void 0`.
+                if !Self::symbol_has_no_live_references(ident.symbol_id(), ctx) {
                     return false;
                 }
                 !Self::var_declaration_is_exported(ctx)

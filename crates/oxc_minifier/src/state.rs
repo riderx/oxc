@@ -132,7 +132,9 @@ pub struct MinifierState<'a> {
     /// what drives a reference count to zero, by deleting the dead cycle that
     /// held the last reference. Without the pin, the count arm then removes
     /// the very declaration the force-root exists to protect (`export var f;`
-    /// silently loses its initializer).
+    /// silently loses its initializer). Every count consult therefore goes
+    /// through `symbol_has_no_live_references`, which vetoes pinned symbols
+    /// before either arm.
     ///
     /// Refreshed at every flush alongside `dead_symbols` and read only through
     /// [`MinifierState::symbol_is_pinned`]. Bits are `SymbolId::index()`.
@@ -184,6 +186,22 @@ impl<'a> MinifierState<'a> {
     /// seeding is skipped.
     pub fn seeds_symbol_facts(&self) -> bool {
         !self.dce || !self.options.treeshake.property_write_side_effects
+    }
+
+    /// Whether the liveness analysis proved this symbol unreachable. Ids
+    /// minted after the last compute are beyond capacity and read as live.
+    pub(crate) fn symbol_is_dead(&self, symbol_id: SymbolId) -> bool {
+        self.dead_symbols.contains(symbol_id.index())
+    }
+
+    /// Whether the analysis pinned this symbol — see
+    /// [`MinifierState::pinned_symbols`]. A pinned symbol must survive BOTH
+    /// removal arms, so the removal sites treat it as referenced no matter
+    /// what its count says. Ids minted after the last refresh are beyond
+    /// capacity and read as unpinned (they are also beyond `dead_symbols`'
+    /// capacity, so they read as live and no removal fires on them anyway).
+    pub(crate) fn symbol_is_pinned(&self, symbol_id: SymbolId) -> bool {
+        self.pinned_symbols.contains(symbol_id.index())
     }
 
     /// Returns whether the AST was mutated since the last call, and resets.

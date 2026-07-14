@@ -1091,8 +1091,15 @@ impl<'a> PeepholeOptimizations {
         }
         if let Some(super_class) = &c.super_class {
             // Unwrap parens and sequence tails — `(0, x)` — so the
-            // classification does not change when a later fold surfaces
-            // the inner expression.
+            // classification cannot flip to `Keep` when a later fold
+            // surfaces the inner expression (a dead-cycle class classified
+            // `RemovesClean` at liveness-compute time must not become
+            // unremovable at its removal site). Other fold families
+            // (`0 || Y` -> `Y`) can still surface an arrow or a risky
+            // identifier mid-pass. Classes are not liveness candidates
+            // (the analysis is functions-only), so a flip can no longer
+            // strand a dead-marked class's computed keys; the unwrap here
+            // only decides this site's own classification.
             let mut e = super_class.get_inner_expression();
             while let Expression::SequenceExpression(seq) = e {
                 let Some(last) = seq.expressions.last() else { break };
@@ -1164,6 +1171,13 @@ impl<'a> PeepholeOptimizations {
     /// machinery. The deeper fix — modeling potentially-uninitialized
     /// identifier reads — belongs in `oxc_ecmascript`'s side-effect layer,
     /// which currently treats every resolved identifier read as pure.
+    ///
+    /// An identifier with no reference id reads as NOT risky. That
+    /// fail-open default is safe only because every minted heritage
+    /// identifier carries a reference id (peephole's single `clone_in`
+    /// site installs one and force-roots its targets). A pass that
+    /// synthesizes a heritage identifier without one would make a `var`
+    /// heritage look removable.
     fn heritage_may_be_uninitialized(ident: &IdentifierReference<'_>, scoping: &Scoping) -> bool {
         const UNINIT_RISK: SymbolFlags = SymbolFlags::Variable.union(SymbolFlags::Class);
         ident
@@ -1175,8 +1189,10 @@ impl<'a> PeepholeOptimizations {
 
     /// Expression kinds the `remove_unused_expression` dispatch above sends
     /// to a specialized handler, which may REDUCE the expression (leaving
-    /// residue) instead of dropping it whole (`ThisExpression` counts as
-    /// specialized: its removal depends on traversal position).
+    /// residue) instead of dropping it whole. The symbol-liveness analysis
+    /// relies on every other pure expression being dropped without residue
+    /// by the generic branch (`ThisExpression` counts as specialized: its
+    /// removal depends on traversal position).
     ///
     /// The dispatch routes through this predicate, so the two cannot drift
     /// silently: a new specialized arm without a predicate entry is dead

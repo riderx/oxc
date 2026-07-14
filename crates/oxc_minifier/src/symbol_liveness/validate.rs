@@ -241,3 +241,83 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         self.walk_declaration(None, |v| walk_variable_declarator(v, it));
     }
 }
+
+/// The CONTRACT, asserted directly on the settled tree:
+///
+/// > a symbol may be dead-marked only if the pass that CONSUMES the bit fully
+/// > deletes every declaration of it.
+///
+/// Every wrong-code bug this analysis has produced — a site no removal reaches,
+/// a position revoked by a relocation mid-pass, a class whose removability
+/// flipped, an init shape rewritten under the gate — is a violation of exactly
+/// that sentence. This checks the sentence itself.
+///
+/// It is the complement of [`compute_dead_symbols`], not a duplicate: the walk
+/// re-derives the analysis and so shares its predicates, which makes it blind
+/// whenever a SHARED predicate is wrong (both sides agree on the same mistake).
+/// This sweep re-derives nothing — it just looks for survivors — so it stays
+/// true however the analysis is rewritten.
+///
+/// Runs at the flush, against the set the finished pass consumed. Legitimate
+/// survivors:
+/// - a declaration removed by this pass or an earlier one is simply absent;
+/// - an INIT-LESS declarator: `try_fold_if` installs `KeepVar`-synthesized
+///   `var x;` into bare slots, and such a declarator holds no references, so a
+///   survivor strands nothing. Exempt.
+pub fn debug_assert_dead_declarations_removed(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    dead: &BitSet<'_>,
+) {
+    if dead.is_empty() {
+        return;
+    }
+    DeadDeclarationSweep { scoping, dead }.visit_program(program);
+}
+
+struct DeadDeclarationSweep<'b, 'c> {
+    scoping: &'b Scoping,
+    dead: &'b BitSet<'c>,
+}
+
+impl DeadDeclarationSweep<'_, '_> {
+    fn check(&self, symbol_id: SymbolId, what: &str) {
+        assert!(
+            !self.dead.contains(symbol_id.index()),
+            "CONTRACT: symbol `{}` was dead-marked, but the pass that consumed the bit left its \
+             {what} standing",
+            self.scoping.symbol_name(symbol_id),
+        );
+    }
+}
+
+impl<'a> Visit<'a> for DeadDeclarationSweep<'_, '_> {
+    fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
+        if it.init.is_some() {
+            it.id.bound_names(&mut |ident| {
+                if let Some(symbol_id) = ident.symbol_id.get() {
+                    self.check(symbol_id, "initialized declarator");
+                }
+            });
+        }
+        walk_variable_declarator(self, it);
+    }
+
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        if it.is_declaration()
+            && let Some(symbol_id) = it.id.as_ref().and_then(|id| id.symbol_id.get())
+        {
+            self.check(symbol_id, "function declaration");
+        }
+        walk_function(self, it, flags);
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        if it.is_declaration()
+            && let Some(symbol_id) = it.id.as_ref().and_then(|id| id.symbol_id.get())
+        {
+            self.check(symbol_id, "class declaration");
+        }
+        walk_class(self, it);
+    }
+}

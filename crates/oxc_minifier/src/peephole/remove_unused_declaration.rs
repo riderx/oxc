@@ -1,13 +1,37 @@
 use super::PeepholeOptimizations;
-use crate::{CompressOptionsUnused, TraverseCtx};
+use crate::{CompressOptionsUnused, TraverseCtx, symbol_liveness};
 use oxc_ast::ast::*;
 use oxc_ecmascript::constant_evaluation::{DetermineValueType, ValueType};
+use oxc_syntax::symbol::SymbolId;
 
 impl<'a> PeepholeOptimizations {
+    /// The global gates are `symbol_liveness::removal_enabled` — one
+    /// definition shared with the liveness candidacy, so the two cannot
+    /// drift (the gate-mirror invariant; see the `symbol_liveness` module
+    /// doc).
     pub(super) fn can_remove_unused_declarators(ctx: &TraverseCtx<'a>) -> bool {
-        ctx.state.options.unused != CompressOptionsUnused::Keep
+        symbol_liveness::removal_enabled(ctx.scoping(), &ctx.state.options)
             && !Self::keep_top_level_var_in_script_mode(ctx)
-            && !ctx.scoping().root_scope_flags().contains_direct_eval()
+    }
+
+    /// Whether no live code can reach this symbol: either it has no resolved
+    /// references at all, or the liveness analysis proved every remaining
+    /// reference sits inside its own dead declaration cycle (#13105). NOT
+    /// "removable" — the removal sites apply their own gates (script mode,
+    /// direct eval, init shape) on top of this.
+    ///
+    /// A PINNED symbol answers `false` whatever either arm says — the count
+    /// arm lies for pinned bindings, because removing a dead cycle discards
+    /// the references it held (`MinifierState::pinned_symbols` has the full
+    /// story). Every consult of these counts must go through this predicate.
+    pub(super) fn symbol_has_no_live_references(
+        symbol_id: SymbolId,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
+        if ctx.state.symbol_is_pinned(symbol_id) {
+            return false;
+        }
+        ctx.scoping().symbol_is_unused(symbol_id) || ctx.state.symbol_is_dead(symbol_id)
     }
 
     fn is_sync_iterator_expr(expr: &Expression<'a>, ctx: &TraverseCtx<'a>) -> bool {
@@ -44,7 +68,7 @@ impl<'a> PeepholeOptimizations {
         match &decl.id {
             BindingPattern::BindingIdentifier(ident) => {
                 if let Some(symbol_id) = ident.symbol_id.get() {
-                    return ctx.scoping().symbol_is_unused(symbol_id);
+                    return Self::symbol_has_no_live_references(symbol_id, ctx);
                 }
                 false
             }
@@ -112,7 +136,7 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        if !ctx.scoping().symbol_is_unused(symbol_id) {
+        if !Self::symbol_has_no_live_references(symbol_id, ctx) {
             return;
         }
         let new_stmt = Statement::new_empty_statement(f.span, ctx);
@@ -131,19 +155,17 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        if !ctx.scoping().symbol_is_unused(symbol_id) {
+        if !Self::symbol_has_no_live_references(symbol_id, ctx) {
             return;
         }
-        if let Some(changed) = Self::remove_unused_class(c, ctx).map(|exprs| {
-            if exprs.is_empty() {
-                Statement::new_empty_statement(c.span, ctx)
-            } else {
-                let expr = Expression::new_sequence_expression(c.span, exprs, ctx);
-                Statement::new_expression_statement(c.span, expr, ctx)
-            }
-        }) {
-            ctx.replace_statement(stmt, changed);
-        }
+        let Some(exprs) = Self::remove_unused_class(c, ctx) else { return };
+        let new_stmt = if exprs.is_empty() {
+            Statement::new_empty_statement(c.span, ctx)
+        } else {
+            let expr = Expression::new_sequence_expression(c.span, exprs, ctx);
+            Statement::new_expression_statement(c.span, expr, ctx)
+        };
+        ctx.replace_statement(stmt, new_stmt);
     }
 
     /// Do remove top level vars in script mode.
