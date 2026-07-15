@@ -1463,9 +1463,10 @@ impl<'a> PeepholeOptimizations {
             else {
                 return true;
             };
-            // we should check whether it's exported by `symbol_value.exported`
-            // because the variable might be exported with `export { foo }` rather than `export var foo`
-            if symbol_value.exported
+            // Count-based removal is blocked for exported or liveness-pinned
+            // bindings. An `export { foo }` specifier also contributes a
+            // reference, so it fails the single-read check below.
+            if symbol_value.count_based_removal_blocked
                 || symbol_value.read_references_count > 1
                 || symbol_value.write_references_count > 0
             {

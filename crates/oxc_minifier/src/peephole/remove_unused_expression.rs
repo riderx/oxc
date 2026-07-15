@@ -781,7 +781,7 @@ impl<'a> PeepholeOptimizations {
             return false;
         };
         // Cannot remove assignment to live bindings: `export let foo; foo = 1;`.
-        if symbol_value.exported {
+        if symbol_value.count_based_removal_blocked {
             return false;
         }
         if symbol_value.read_references_count > 0 {
@@ -991,7 +991,7 @@ impl<'a> PeepholeOptimizations {
         let Some(sv) = ctx.state.symbol_values.get_symbol_value(symbol_id) else {
             return false;
         };
-        if sv.kind == FreshValueKind::None || sv.exported {
+        if sv.kind == FreshValueKind::None || sv.count_based_removal_blocked {
             return false;
         }
         // Check: all references are member write targets (O(1) via pre-computed count).

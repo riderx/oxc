@@ -515,9 +515,10 @@ pub fn propagate_collected<'a>(
     #[cfg_attr(not(debug_assertions), expect(unused_variables))] program: &Program<'a>,
     ctx: &mut TraverseCtx<'a>,
 ) -> bool {
-    let found_new_dead = {
-        let crate::state::MinifierState { liveness: lv, dead_symbols, pinned_symbols, .. } =
-            &mut ctx.state;
+    let needs_liveness_pass = {
+        let TraverseCtx { state, scoping, .. } = ctx;
+        let scoping = scoping.scoping();
+        let crate::state::MinifierState { liveness: lv, dead_symbols, pinned_symbols, .. } = state;
         if !lv.active {
             return false;
         }
@@ -530,38 +531,51 @@ pub fn propagate_collected<'a>(
             lv.mark_live_root(symbol_id);
         }
 
-        // No candidates admitted ⇒ no edges (an edge needs an enclosing
-        // candidate region) and no dead set: skip the worklist drain and the
-        // set scan (mirrors `compute_dead_symbols`' early-out). The swap
-        // still runs so a stale dead set from the previous pass clears.
-        if lv.candidates.is_empty() {
-            std::mem::swap(dead_symbols, &mut lv.dead_next);
-            std::mem::swap(pinned_symbols, &mut lv.pinned_next);
-            return false;
-        }
-
-        // Candidacy is fully known post-collection, so drop the edges whose
-        // targets were never admitted (exported functions,
-        // function-expression names) before they hit the sort — such a
-        // target can never be dead. A removed edge's only effect was a live
-        // mark on a non-candidate, which nothing consults.
-        {
-            let LivenessCollect { edges, candidates, .. } = &mut *lv;
-            edges.retain(|&(_, target)| candidates.contains(target.index()));
-        }
-
-        propagate(&lv.candidates, &mut lv.live, &mut lv.roots, &mut lv.edges);
-
-        for candidate in lv.candidates.ones() {
-            if !lv.live.contains(candidate) {
-                lv.dead_next.set_bit(candidate);
+        let found_new_dead = if lv.candidates.is_empty() {
+            // No candidates admitted ⇒ no edges (an edge needs an enclosing
+            // candidate region) and no dead set: skip the worklist drain and
+            // set scan (mirrors `compute_dead_symbols`' early-out).
+            false
+        } else {
+            // Candidacy is fully known post-collection, so drop the edges whose
+            // targets were never admitted (exported functions,
+            // function-expression names) before they hit the sort — such a
+            // target can never be dead. A removed edge's only effect was a live
+            // mark on a non-candidate, which nothing consults.
+            {
+                let LivenessCollect { edges, candidates, .. } = &mut *lv;
+                edges.retain(|&(_, target)| candidates.contains(target.index()));
             }
-        }
 
-        // Per-bit scan; a word-level set-difference helper would make this
-        // O(words) — a possible `oxc_allocator` follow-up. Until then, gate
-        // the common terminal-pass case (empty dead set).
-        !lv.dead_next.is_empty() && lv.dead_next.ones().any(|bit| !dead_symbols.contains(bit))
+            propagate(&lv.candidates, &mut lv.live, &mut lv.roots, &mut lv.edges);
+
+            for candidate in lv.candidates.ones() {
+                if !lv.live.contains(candidate) {
+                    lv.dead_next.set_bit(candidate);
+                }
+            }
+
+            // Per-bit scan; a word-level set-difference helper would make this
+            // O(words) — a possible `oxc_allocator` follow-up. Until then, gate
+            // the common terminal-pass case (empty dead set).
+            !lv.dead_next.is_empty() && lv.dead_next.ones().any(|bit| !dead_symbols.contains(bit))
+        };
+
+        // A stale pin may have vetoed a count-based removal during this pass.
+        // If the settled tree no longer demands that pin, run once more when
+        // the symbol can still have a waiting consumer: a remaining reference,
+        // or another declaration site. The latter is reachable for a `var`
+        // symbol shared by a removed for-in/of head and a surviving sibling
+        // declaration. A released sole-site pin needs no extra traversal.
+        let pins_released = pinned_symbols.ones().any(|bit| {
+            if lv.pinned_next.contains(bit) {
+                return false;
+            }
+            let symbol_id = SymbolId::from_usize(bit);
+            !scoping.get_resolved_reference_ids(symbol_id).is_empty()
+                || !scoping.symbol_redeclarations(symbol_id).is_empty()
+        });
+        found_new_dead || pins_released
     };
 
     #[cfg(debug_assertions)]
@@ -571,14 +585,7 @@ pub fn propagate_collected<'a>(
         &mut ctx.state;
     std::mem::swap(dead_symbols, &mut lv.dead_next);
     std::mem::swap(pinned_symbols, &mut lv.pinned_next);
-    // A released pin never strands a waiting removal here: v1 pins sit on
-    // export wrappers (never removed) or on for-in/of heads and `using`
-    // declarators, whose bindings can only disappear WITH their whole
-    // statement (unreachable-code removal) — declaration and references
-    // die together, so no consult is left waiting on the stale pin. Sloppy
-    // sources will need a release-driven extra pass (Annex B blockers);
-    // that arrives with them.
-    found_new_dead
+    needs_liveness_pass
 }
 
 /// Debug-only flush validation, before the swaps: the fresh sets are still

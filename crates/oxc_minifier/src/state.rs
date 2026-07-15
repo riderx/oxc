@@ -137,7 +137,7 @@ pub struct MinifierState<'a> {
     /// before either arm.
     ///
     /// Refreshed at every flush alongside `dead_symbols` and read only through
-    /// [`MinifierState::symbol_is_pinned`]. Bits are `SymbolId::index()`.
+    /// `MinifierState::symbol_is_pinned`. Bits are `SymbolId::index()`.
     pub(crate) pinned_symbols: BitSet<'a>,
 
     /// In-traversal liveness collection for the CURRENT peephole pass; see

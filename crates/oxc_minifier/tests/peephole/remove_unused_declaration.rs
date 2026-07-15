@@ -910,6 +910,21 @@ fn keep_exported_var_initializer_when_a_dead_cycle_held_its_only_reference() {
     );
 }
 
+// Pins must protect every count-based removal, not only declaration sites.
+// Deleting the dead cycle removes the last ordinary read of `f`; assignments
+// and member writes are still observable through the exported binding.
+#[test]
+fn keep_exported_binding_writes_when_a_dead_cycle_held_its_other_reads() {
+    test_smallest(
+        "export var f; var f = 0; function d1() { console.log(f); d2() } function d2() { d1() } f = 1;",
+        "export var f;\nvar f = 0;\nf = 1;",
+    );
+    test_smallest(
+        "export var f; var f = {}; function d1() { console.log(f); d2() } function d2() { d1() } f.x = 1;",
+        "export var f;\nvar f = {};\nf.x = 1;",
+    );
+}
+
 // The collection arms for ESM modules only: in a script or CommonJS source
 // the feature's core shape — a dead function cycle — must survive
 // byte-unchanged (exactly `main`'s behavior, at zero cost). Sloppy sources
@@ -924,19 +939,21 @@ fn analysis_off_for_non_module_sources() {
     test_same_options_source_type(cycle, SourceType::cjs(), &options);
 }
 
-// A v1 pin CAN be released: unreachable-code removal deletes a whole
-// `for..of` statement, pinned head binding included. That is harmless by
-// construction — the binding's declaration and references die together, so
-// no removal consult is left waiting on the stale pin — which is why v1
-// needs no release-driven extra pass (`pins_released` arrives with sloppy
-// sources, whose Annex B blockers CAN leave a consult waiting). Verified
-// `--twice`-idempotent through the example binary.
+// A pin can be released when unreachable-code removal deletes a `for..of`
+// head. Usually the binding disappears with it; a `var` head can also share
+// its symbol with a surviving sibling declaration, in which case the stale
+// pin may have vetoed a removal and its release must request another pass.
 #[test]
 fn remove_unreachable_for_of_head_with_pinned_binding() {
     test_smallest(
         "export function f() { return 1; for (const x of arr) g(x); }",
         "export function f() {\n\treturn 1;\n}",
     );
+    test_smallest(
+        "var f = 1; function d1() { f; d2() } function d2() { d1() } if (false) for (var f of xs) {} export {};",
+        "export {};",
+    );
+    test_smallest("if (false) for (var f of xs) {} f = 1; export {};", "export {};");
 }
 
 // The pin veto must also gate `is_expression_result_unused`

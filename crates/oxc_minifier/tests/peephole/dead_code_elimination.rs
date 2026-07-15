@@ -790,6 +790,18 @@ fn dce_recursive_unused_functions() {
     // Live references root the cycle.
     test_same("function f() {\n\tf();\n}\nconsole.log(f);");
     test_same("export function f() {\n\tf();\n}");
+    // Removing a dead cycle can zero an exported sibling redeclaration's
+    // ordinary read count; its observable writes remain protected by the pin.
+    test(
+        "export var f; var f = 0; function d1() { console.log(f); d2() } function d2() { d1() } f = 1;",
+        "export var f;\nvar f = 0;\nf = 1;",
+    );
+    // Releasing a stale for-head pin requests the pass that removes a sibling
+    // declaration the pin had kept alive.
+    test(
+        "var f = 1; function d1() { f; d2() } function d2() { d1() } if (false) for (var f of xs) {} export {};",
+        "export {};",
+    );
     // The block unwrap relocates the declarator into the bare if-consequent
     // slot mid-pass, where no removal site reaches it — the cycle must stay
     // whole rather than lose `function a` to the stale dead set. Reachable

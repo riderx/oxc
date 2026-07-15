@@ -290,14 +290,20 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
         falsy_init: bool,
         init_absent: bool,
     ) {
-        let mut exported = false;
+        // A liveness pin makes reference counts non-authoritative in the same
+        // way as a direct export wrapper: count-based consumers must not
+        // remove the binding, its assignments, or its member writes. Seed the
+        // existing protection bit from the consumed pin set so every
+        // `SymbolValue` consumer observes the veto, not just declaration
+        // removal.
+        let mut count_based_removal_blocked = self.state.symbol_is_pinned(symbol_id);
         if self.scoping.current_scope_id() == self.scoping().root_scope_id() {
             for ancestor in self.ancestors() {
                 if ancestor.is_export_named_declaration()
                     || ancestor.is_export_all_declaration()
                     || ancestor.is_export_default_declaration()
                 {
-                    exported = true;
+                    count_based_removal_blocked = true;
                 }
             }
         }
@@ -344,7 +350,7 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
         let symbol_value = SymbolValue {
             initialized_constant,
             implicit_undefined,
-            exported,
+            count_based_removal_blocked,
             read_references_count,
             write_references_count,
             member_write_target_read_count,
