@@ -448,21 +448,17 @@ impl<'a> PeepholeOptimizations {
     }
 
     /// End-of-pass sequence: flush the dirty accumulator into scoping, then
-    /// consume the pass's liveness collection — which must observe the
-    /// post-flush scoping (its debug ground-truth walk validates against
-    /// it), so fusing the pair makes the ordering structural. Returns
-    /// whether liveness demands another pass (see
-    /// `symbol_liveness::propagate_collected`).
+    /// derive function reachability from those settled semantic references.
+    /// Keeping the pair together makes the ordering structural. Returns
+    /// whether newly dead functions demand another pass.
     pub(crate) fn end_pass(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
         Self::flush_pass_dirty(program, ctx);
-        symbol_liveness::propagate_collected(program, ctx)
+        symbol_liveness::analyze(program, ctx)
     }
 }
 
 impl<'a> Traverse<'a> for PeepholeOptimizations {
     fn enter_program(&mut self, program: &mut Program<'a>, ctx: &mut TraverseCtx<'a>) {
-        // Reset the in-pass liveness collection (runs in dce mode too).
-        symbol_liveness::begin_pass(ctx);
         ctx.state.symbol_values.reset();
         // Any module loader (`import`, `export * from`, `export … from`) can, on a
         // cycle, evaluate a foreign module that observes a not-yet-assigned binding
@@ -481,38 +477,6 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
             (ctx.scoping().root_scope_id(), module_has_loaders);
         // `PassDirty` is managed by the `Compressor` driver via
         // `flush_pass_dirty`, not reset per traversal.
-    }
-
-    // Liveness-collection delegations — keep this set in sync with the
-    // identical one in `Normalize` (both traversals collect; the membership
-    // is part of the analysis contract, see the `symbol_liveness` module
-    // doc). Deliberately no dce gating: collection runs in dce mode too.
-    fn enter_identifier_reference(
-        &mut self,
-        node: &mut IdentifierReference<'a>,
-        ctx: &mut TraverseCtx<'a>,
-    ) {
-        symbol_liveness::collect_identifier_reference(node, ctx);
-    }
-
-    fn enter_function(&mut self, node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        symbol_liveness::collect_enter_function(node, ctx);
-    }
-
-    fn exit_function(&mut self, _node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        symbol_liveness::collect_exit_function(ctx);
-    }
-
-    fn enter_class(&mut self, node: &mut Class<'a>, ctx: &mut TraverseCtx<'a>) {
-        symbol_liveness::collect_enter_class(node, ctx);
-    }
-
-    fn enter_variable_declarator(
-        &mut self,
-        node: &mut VariableDeclarator<'a>,
-        ctx: &mut TraverseCtx<'a>,
-    ) {
-        symbol_liveness::collect_enter_variable_declarator(node, ctx);
     }
 
     fn enter_function_body(&mut self, _body: &mut FunctionBody<'a>, ctx: &mut TraverseCtx<'a>) {

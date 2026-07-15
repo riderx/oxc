@@ -14,24 +14,18 @@ impl<'a> PeepholeOptimizations {
             && !Self::keep_top_level_var_in_script_mode(ctx)
     }
 
-    /// Whether no live code can reach this symbol: either it has no resolved
-    /// references at all, or the liveness analysis proved every remaining
-    /// reference sits inside its own dead declaration cycle (#13105). NOT
-    /// "removable" — the removal sites apply their own gates (script mode,
-    /// direct eval, init shape) on top of this.
-    ///
-    /// A PINNED symbol answers `false` whatever either arm says — the count
-    /// arm lies for pinned bindings, because removing a dead cycle discards
-    /// the references it held (`MinifierState::pinned_symbols` has the full
-    /// story). Every consult of these counts must go through this predicate.
-    pub(super) fn symbol_has_no_live_references(
-        symbol_id: SymbolId,
-        ctx: &TraverseCtx<'a>,
-    ) -> bool {
-        if ctx.state.symbol_is_pinned(symbol_id) {
-            return false;
-        }
-        ctx.scoping().symbol_is_unused(symbol_id) || ctx.state.symbol_is_dead(symbol_id)
+    /// Count-based unusedness shared by declarations, assignments, member
+    /// writes, IIFE folding, and single-use substitution. Module exports make
+    /// a binding observable even with no references inside this module.
+    pub(super) fn symbol_is_unused_by_count(symbol_id: SymbolId, ctx: &TraverseCtx<'a>) -> bool {
+        !ctx.state.symbol_is_externally_observable(symbol_id)
+            && ctx.scoping().symbol_is_unused(symbol_id)
+    }
+
+    /// Function declarations additionally consume graph deadness, allowing
+    /// self- and mutually-recursive cycles to be removed.
+    fn function_has_no_live_references(symbol_id: SymbolId, ctx: &TraverseCtx<'a>) -> bool {
+        Self::symbol_is_unused_by_count(symbol_id, ctx) || ctx.state.function_is_dead(symbol_id)
     }
 
     fn is_sync_iterator_expr(expr: &Expression<'a>, ctx: &TraverseCtx<'a>) -> bool {
@@ -68,7 +62,7 @@ impl<'a> PeepholeOptimizations {
         match &decl.id {
             BindingPattern::BindingIdentifier(ident) => {
                 if let Some(symbol_id) = ident.symbol_id.get() {
-                    return Self::symbol_has_no_live_references(symbol_id, ctx);
+                    return Self::symbol_is_unused_by_count(symbol_id, ctx);
                 }
                 false
             }
@@ -136,7 +130,7 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        if !Self::symbol_has_no_live_references(symbol_id, ctx) {
+        if !Self::function_has_no_live_references(symbol_id, ctx) {
             return;
         }
         let new_stmt = Statement::new_empty_statement(f.span, ctx);
@@ -155,7 +149,7 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        if !Self::symbol_has_no_live_references(symbol_id, ctx) {
+        if !Self::symbol_is_unused_by_count(symbol_id, ctx) {
             return;
         }
         let Some(exprs) = Self::remove_unused_class(c, ctx) else { return };

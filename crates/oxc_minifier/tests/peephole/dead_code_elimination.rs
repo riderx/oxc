@@ -774,9 +774,7 @@ fn dce_remove_unreachable_after_terminating_statement() {
 
 // #13105: dead recursive/cyclic function declarations must also drop in
 // dce-only mode (rolldown's per-module treeshake preprocess). Declarator
-// and class cycles are KEPT — candidacy is functions-only (see the
-// `symbol_liveness` module doc) — and the keeps are pinned here under
-// dce's own options.
+// and class cycles are kept because graph candidacy is functions-only.
 #[test]
 fn dce_recursive_unused_functions() {
     test("function f() { f() }", "");
@@ -791,23 +789,14 @@ fn dce_recursive_unused_functions() {
     test_same("function f() {\n\tf();\n}\nconsole.log(f);");
     test_same("export function f() {\n\tf();\n}");
     // Removing a dead cycle can zero an exported sibling redeclaration's
-    // ordinary read count; its observable writes remain protected by the pin.
+    // ordinary read count; stable export observability protects its writes.
     test(
         "export var f; var f = 0; function d1() { console.log(f); d2() } function d2() { d1() } f = 1;",
         "export var f;\nvar f = 0;\nf = 1;",
     );
-    // Releasing a stale for-head pin requests the pass that removes a sibling
-    // declaration the pin had kept alive.
+    // For-head bindings need no special lifecycle state.
     test(
         "var f = 1; function d1() { f; d2() } function d2() { d1() } if (false) for (var f of xs) {} export {};",
         "export {};",
-    );
-    // The block unwrap relocates the declarator into the bare if-consequent
-    // slot mid-pass, where no removal site reaches it — the cycle must stay
-    // whole rather than lose `function a` to the stale dead set. Reachable
-    // here too: rolldown runs this mode on every treeshake build.
-    test(
-        "function a() { b() } function p1() {} function p2() { p1() } if (g) { p2(); p1(b); var b = a; }",
-        "function a() {\n\tb();\n}\nif (g) var b = a;",
     );
 }

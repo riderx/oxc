@@ -777,13 +777,13 @@ impl<'a> PeepholeOptimizations {
         if ctx.scoping().symbol_flags(symbol_id).is_const_variable() {
             return false;
         }
+        // Cannot remove assignment to live bindings: `export let foo; foo = 1;`.
+        if ctx.state.symbol_is_externally_observable(symbol_id) {
+            return false;
+        }
         let Some(symbol_value) = ctx.state.symbol_values.get_symbol_value(symbol_id) else {
             return false;
         };
-        // Cannot remove assignment to live bindings: `export let foo; foo = 1;`.
-        if symbol_value.count_based_removal_blocked {
-            return false;
-        }
         if symbol_value.read_references_count > 0 {
             return false;
         }
@@ -988,10 +988,13 @@ impl<'a> PeepholeOptimizations {
         }
 
         // Check: symbol creates a fresh value (not an alias) and is not exported.
+        if ctx.state.symbol_is_externally_observable(symbol_id) {
+            return false;
+        }
         let Some(sv) = ctx.state.symbol_values.get_symbol_value(symbol_id) else {
             return false;
         };
-        if sv.kind == FreshValueKind::None || sv.count_based_removal_blocked {
+        if sv.kind == FreshValueKind::None {
             return false;
         }
         // Check: all references are member write targets (O(1) via pre-computed count).

@@ -9,7 +9,7 @@ use oxc_str::Str;
 use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 
 use crate::{
-    CompressOptions, symbol_facts::PersistentSymbolFacts, symbol_liveness::LivenessCollect,
+    CompressOptions, symbol_facts::PersistentSymbolFacts, symbol_liveness::SymbolReachability,
     symbol_value::SymbolValues,
 };
 
@@ -106,44 +106,10 @@ pub struct MinifierState<'a> {
     /// the incremental scoping refresh.
     pub(crate) dirty: PassDirty<'a>,
 
-    /// Candidate symbols proven unreachable by the whole-program liveness
-    /// analysis (`symbol_liveness`): declarations whose every reference sits
-    /// inside their own — or their reference cycle's — removable bodies, so
-    /// no live code can ever reach them (#13105). Seeded pre-loop from the
-    /// collection gathered during `Normalize`'s traversal (see
-    /// `symbol_liveness::begin_pass`), then refreshed at every flush
-    /// from the collection the peephole traversal gathered during the pass
-    /// (see [`LivenessCollect`]) — always exactly one pass stale. Consumed
-    /// alongside `symbol_is_unused` by the removal sites in
-    /// `remove_unused_declaration.rs`. Bits are `SymbolId::index()`; ids
-    /// minted after the last refresh are beyond capacity and read as live.
-    pub(crate) dead_symbols: BitSet<'a>,
-
-    /// Symbols the analysis PINNED this pass — bindings whose observability
-    /// no reference count can express. Exactly three producers today, all in
-    /// `symbol_liveness`: export-wrapped declarations (importers observe the
-    /// binding), for-in/of heads, and `using` declarators (no removal site
-    /// handles either). Enabling sloppy sources will add script-globals and
-    /// Annex B alias blockers.
-    ///
-    /// Pinning is strictly stronger than force-rooting, and both are needed:
-    /// force-rooting keeps the symbol out of `dead_symbols`, but the removal
-    /// sites consult `symbol_is_unused` TOO — and this analysis is exactly
-    /// what drives a reference count to zero, by deleting the dead cycle that
-    /// held the last reference. Without the pin, the count arm then removes
-    /// the very declaration the force-root exists to protect (`export var f;`
-    /// silently loses its initializer). Every count consult therefore goes
-    /// through `symbol_has_no_live_references`, which vetoes pinned symbols
-    /// before either arm.
-    ///
-    /// Refreshed at every flush alongside `dead_symbols` and read only through
-    /// `MinifierState::symbol_is_pinned`. Bits are `SymbolId::index()`.
-    pub(crate) pinned_symbols: BitSet<'a>,
-
-    /// In-traversal liveness collection for the CURRENT peephole pass; see
-    /// `symbol_liveness` for the architecture. Reset at `enter_program`,
-    /// consumed by `symbol_liveness::propagate_collected` at flush.
-    pub(crate) liveness: LivenessCollect<'a>,
+    /// Module export observability plus the optional recursive-function graph.
+    /// Normalize records stable declaration metadata once; post-flush analysis
+    /// derives reachability from the current semantic reference lists.
+    pub(crate) symbol_reachability: Option<SymbolReachability<'a>>,
 
     /// Scratch buffer reused by `try_fold_concat` to build template literal
     /// quasis without allocating a fresh `String` per call.
@@ -158,6 +124,8 @@ impl<'a> MinifierState<'a> {
         scoping: &Scoping,
         allocator: &'a Allocator,
     ) -> Self {
+        let symbol_reachability =
+            SymbolReachability::new(source_type, &options, scoping, allocator);
         Self {
             source_type,
             options,
@@ -169,9 +137,7 @@ impl<'a> MinifierState<'a> {
             body_unsafe_stack: NonEmptyStack::new((scoping.root_scope_id(), false)),
             mutated: false,
             dirty: PassDirty::new(scoping.references_len(), allocator),
-            dead_symbols: BitSet::new_in(0, allocator),
-            pinned_symbols: BitSet::new_in(0, allocator),
-            liveness: LivenessCollect::new(allocator),
+            symbol_reachability,
             concat_scratch: String::new(),
         }
     }
@@ -188,20 +154,20 @@ impl<'a> MinifierState<'a> {
         !self.dce || !self.options.treeshake.property_write_side_effects
     }
 
-    /// Whether the liveness analysis proved this symbol unreachable. Ids
-    /// minted after the last compute are beyond capacity and read as live.
-    pub(crate) fn symbol_is_dead(&self, symbol_id: SymbolId) -> bool {
-        self.dead_symbols.contains(symbol_id.index())
+    /// Whether another module can observe this binding even when there are no
+    /// references to it in the current module.
+    pub(crate) fn symbol_is_externally_observable(&self, symbol_id: SymbolId) -> bool {
+        self.symbol_reachability
+            .as_ref()
+            .is_some_and(|reachability| reachability.is_externally_observable(symbol_id))
     }
 
-    /// Whether the analysis pinned this symbol — see
-    /// [`MinifierState::pinned_symbols`]. A pinned symbol must survive BOTH
-    /// removal arms, so the removal sites treat it as referenced no matter
-    /// what its count says. Ids minted after the last refresh are beyond
-    /// capacity and read as unpinned (they are also beyond `dead_symbols`'
-    /// capacity, so they read as live and no removal fires on them anyway).
-    pub(crate) fn symbol_is_pinned(&self, symbol_id: SymbolId) -> bool {
-        self.pinned_symbols.contains(symbol_id.index())
+    /// Whether post-flush graph analysis proved a function declaration
+    /// unreachable from executing code.
+    pub(crate) fn function_is_dead(&self, symbol_id: SymbolId) -> bool {
+        self.symbol_reachability
+            .as_ref()
+            .is_some_and(|reachability| reachability.function_is_dead(symbol_id))
     }
 
     /// Returns whether the AST was mutated since the last call, and resets.

@@ -1,634 +1,378 @@
-//! Whole-program symbol liveness for unused-declaration removal (#13105).
+//! Reachability for recursively referenced function declarations (#13105).
 //!
-//! `Scoping::symbol_is_unused` is reference-count based; a reference cycle
-//! keeps every member's count above zero forever, so `function c() { d() }
-//! function d() { c() }` survives even though no live code can reach it.
-//! This module computes reachability instead. ESM MODULES ONLY (see
-//! [`collection_enabled`]): sloppy sources — scripts, CommonJS — carry
-//! observability the reference count cannot express (script-globals,
-//! Annex B block-function aliases) and are deliberately not analyzed yet;
-//! they take a zero-cost off path. Three rules generate everything in this
-//! file — hold these, and read the rest as their application to specific
-//! constructs:
+//! Reference counting removes an acyclic unused declaration once its last
+//! reference disappears, but it cannot remove `function a() { b() }
+//! function b() { a() }`: each function keeps the other's count non-zero.
+//! For strict ES modules, this module adds the missing reachability question:
+//! can executing code reach a candidate function declaration?
 //!
-//! 1. **A reference either EXECUTES or sits inside a REMOVABLE
-//!    declaration.** Executing references are roots. References inside a
-//!    candidate declaration's deferred region (its function body) are edges
-//!    `(owner -> target)` that count only if the owner is live. Propagating
-//!    from the roots reaches exactly the live set; a dead cycle is simply
-//!    never reached — there is no cycle detection anywhere.
-//! 2. **If removal cannot fully delete a site, its symbols must count as
-//!    live** (force-root). Deadness is consumed per SYMBOL but removal
-//!    happens per SITE — and `var`s redeclare — so one undeletable site
-//!    must protect every site of the symbol.
-//! 3. **The tree mutates under the analysis**, so re-collect every pass,
-//!    and force-root whatever an in-pass collection provably could not
-//!    have seen.
+//! Four concepts define the analysis:
 //!
-//! ## Rule 1 applied: candidacy and the gate-mirror invariant
+//! 1. **Candidates** are function declarations. Other declaration kinds keep
+//!    using the ordinary resolved-reference count.
+//! 2. **Ownership** comes from semantic scopes. A reference whose scope is
+//!    nested in a candidate function is an edge from that function; every
+//!    other reference is a root.
+//! 3. **External observability** is stable metadata collected from module
+//!    exports. It protects every count-based consumer, not only declaration
+//!    removal, because importers can observe a binding with no in-module
+//!    references.
+//! 4. **Analysis runs after scoping is flushed.** Every result is derived from
+//!    the settled resolved-reference lists, so AST rewrites need no parallel
+//!    collection hooks or behind-the-cursor repair log.
 //!
-//! Candidacy is FUNCTION DECLARATIONS ONLY. Declarator and class candidacy
-//! were built, hardened over several review rounds, and then measured to
-//! contribute exactly zero output bytes on 17 real artifacts (the 10-bundle
-//! minsize corpus plus 7 modern ESM artifacts, including a real
-//! rolldown-treeshaken Vue chunk) while owning the majority of the
-//! analysis's hazard surface — statement-relocation movers, init-shape
-//! staleness, class-removability fold-flips — so they were cut. Real-world
-//! dead cycles are function-declaration cycles.
-//!
-//! Candidacy must be a SUBSET of what the removal sites in
-//! `remove_unused_declaration.rs` delete cleanly, with zero residue: a dead
-//! cycle is removed whole in one pass, and a blocked member would leave
-//! references to deleted peers (ReferenceError). The definitions are shared
-//! so the two sides cannot silently drift:
-//!
-//! - global gates: `can_remove_unused_declarators` delegates to
-//!   [`removal_enabled`] (`unused != Keep` plus the root
-//!   `ScopeFlags::DirectEval` skip — the flag propagates to the root from
-//!   any direct eval, subsuming per-site checks); the collection arms on
-//!   [`collection_enabled`], a strict SUBSET that adds the module-only
-//!   condition, so candidacy is only ever granted where removal is allowed.
-//!   (`remove_unused_function_declaration` itself shares by argument, not
-//!   by delegation — its per-scope direct-eval check is deliberately finer
-//!   than the root flag; the contract sweep in `validate.rs` is the net if
-//!   the two ever disagree.)
-//! - function declarations always drop whole — there is no shape axis for
-//!   them, which is exactly why functions-only candidacy is cheap to keep
-//!   sound.
-//!
-//! Non-candidacy is self-correcting: no region opens, so the declaration's
-//! interior references record as roots — the conservative direction.
-//!
-//! ## Rule 2 applied: observability the reference count cannot express
-//!
-//! Non-candidate declarations cannot be removed BY THE ANALYSIS, but the
-//! count-based removal arm still consults their reference counts — and
-//! removing a dead function cycle discards the references that cycle held,
-//! driving an observable binding's count to zero. Pins mark the bindings
-//! whose observability the count cannot express — in a module, exactly
-//! these (each row prevents a reviewed wrong-code repro):
-//!
-//! | gate | what it prevents |
-//! |---|---|
-//! | export-wrapped declarations | `export var f;` carries no reference, yet importers observe the binding — a removable sibling site would strip the initializer |
-//! | for-in/of head and `using` declarators | no removal site handles them; their survival must not depend on counts |
-//!
-//! (Sloppy sources add script-globals and Annex B block-function aliases
-//! to this table; that is why they are not analyzed yet.)
-//!
-//! Every gate in this table PINS (`pin_live_root`), which is strictly
-//! stronger than force-rooting, and the difference is load-bearing. Rooting
-//! only keeps a symbol out of `dead_symbols` — but the removal sites ask
-//! `symbol_is_unused || symbol_is_dead`, and removing a dead cycle DISCARDS
-//! the references that cycle held. So a symbol whose surviving references all
-//! sat in the cycle we just deleted drops to ZERO references, and the count
-//! arm removes the very declaration the gate exists to protect: `export var f;`
-//! silently loses its initializer. Reference counting alone can never reach
-//! that state — which is exactly why main needs none of these gates, and why
-//! rooting looked sufficient until it wasn't. A pin closes both arms
-//! (`MinifierState::pinned_symbols`).
-//!
-//! ## Rule 3 applied: cadence and the force-root log
-//!
-//! `Normalize` seeds the first set — source-level cycles are removable in
-//! pass 1, before the loop's rewrites can spoil their candidate shape.
-//! Every peephole pass then re-collects while it mutates, and every flush
-//! ([`propagate_collected`]) publishes a fresh set, so the set a pass
-//! consumes is always exactly one pass stale. Freshness is load-bearing:
-//! rewrites EXPOSE cycles mid-loop (a call dropped once its callee is
-//! proven pure, a folded define-replacement branch), and every cheaper
-//! cadence was built and falsified — a standalone walk per pass cost
-//! +15-22% wall; lazy/fixed-point-tail consumption lost output (exposed
-//! cycles perish); one-shot and two-shot variants failed monitor-oxc's
-//! idempotency gate on real npm packages (js_of_ocaml bundles), because
-//! any fixed number of early collections stays one rewrite behind. A
-//! record-time edge filter was also net-negative; junk edges are dropped
-//! post-collection instead.
-//!
-//! In-pass collection can diverge from a settled-tree walk in one dangerous
-//! direction — publishing a live-referenced symbol as dead — and the single
-//! rewrite that can cause it is logged into
-//! [`LivenessCollect::force_root_log`] and force-rooted at the flush: a
-//! bound reference MINTED behind the traversal cursor (each minting pass
-//! logs at its call site — the typeof rewrite in
-//! `substitute_alternate_syntax` is the only minter today, and the debug
-//! ground-truth validator flags an unlogged mint anywhere in the corpus).
-//! Function-declaration sites have no other staleness axis: statement
-//! movers relocate whole function declarations between slots
-//! `exit_statement` visits either way, folds cannot change what a function
-//! declaration is, and substitution never rewrites one.
-//!
-//! ## The oracle
-//!
-//! In debug builds every flushed set is validated against an INDEPENDENT
-//! re-derivation on the settled tree (`validate.rs`), so the whole test and
-//! conformance corpus doubles as a differ between the in-pass collection
-//! and ground truth. Read that file to CHECK this one, not to understand
-//! it.
-//!
-//! ## Allocation discipline
-//!
-//! Everything sized by the program lives in the arena, like
-//! `PassDirty::dead_refs`. References are filtered at record time on
-//! candidate-kind `SymbolFlags` — `Function` only, so locals and parameters
-//! never earn storage; only references to function declarations record at
-//! all (when the wider declarator/class candidacy existed, 77-84% of edges
-//! were unusable junk). Roots are deduplicated at record time by marking
-//! them live immediately, and the edge "graph" is a flat list sorted by
-//! source symbol, range-scanned via `partition_point` — no per-candidate
-//! allocations. The in-pass collection buffers are `clear()`-reused across
-//! passes, keeping system allocations untouched.
+//! The graph is module-only. Script and CommonJS observability includes
+//! script globals and Annex B aliases that are intentionally outside this
+//! first version.
 
-use oxc_allocator::{Allocator, BitSet, GetAllocator, Vec as ArenaVec};
+use oxc_allocator::{Allocator, BitSet, Vec as ArenaVec};
 use oxc_ast::ast::*;
+#[cfg(debug_assertions)]
+use oxc_ast_visit::{Visit, walk::walk_function};
 use oxc_ecmascript::BoundNames;
+use oxc_index::IndexVec;
 use oxc_semantic::Scoping;
 use oxc_span::SourceType;
-use oxc_syntax::symbol::{SymbolFlags, SymbolId};
+use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 
-use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx, generated::ancestor::Ancestor};
-
-#[cfg(debug_assertions)]
-mod validate;
-#[cfg(debug_assertions)]
-pub use validate::{compute_dead_symbols, debug_assert_dead_declarations_removed};
-
-// ========================================================================
-// Shared predicates: the gate definitions (rules 1 and 2)
-// ========================================================================
-
-/// Symbol kinds a liveness candidate can have: function declarations only
-/// (see the module doc for why declarator and class candidacy were cut). A
-/// necessary (not sufficient) condition for candidacy; doubles as the
-/// record-time reference filter, so references to anything else earn no
-/// storage.
-const CANDIDATE_KINDS: SymbolFlags = SymbolFlags::Function;
+use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx};
 
 /// Whether unused-declaration removal is enabled for this program state.
-/// The single definition of the global gates: `can_remove_unused_declarators`
-/// (the removal sites' guard) delegates here, so candidacy and removal
-/// cannot drift. Any direct eval flags the root via ancestor propagation —
-/// see `refresh_direct_eval_flags`.
+/// Any direct eval marks the root scope through ancestor propagation; once
+/// the eval is removed, `flush_pass_dirty` refreshes the flags and the next
+/// analysis can proceed.
 pub fn removal_enabled(scoping: &Scoping, options: &CompressOptions) -> bool {
     options.unused != CompressOptionsUnused::Keep
         && !scoping.root_scope_flags().contains_direct_eval()
 }
 
-/// Whether the liveness COLLECTION arms for this program: [`removal_enabled`]
-/// plus ESM modules only. `source_type` is the PARSER-RESOLVED kind
-/// (ambiguous `.js`/`.ts` resolves by content), so anything that is not
-/// certainly a strict ES module — scripts, CommonJS,
-/// ambiguous-resolved-script — takes the existing zero-cost off path: no
-/// allocation, no per-node work, and the count-based removal arm behaves
-/// exactly as on `main`. Sloppy sources add observability the reference
-/// count cannot express (script-globals, Annex B block-function aliases);
-/// enabling them is deliberate follow-up work, not a missing `!`.
+/// Stable module-wide symbol facts plus the optional recursive-function graph.
 ///
-/// A strict subset of [`removal_enabled`], which keeps the gate-mirror
-/// invariant structural: candidacy (collection) is only ever granted where
-/// removal is already allowed.
-pub fn collection_enabled(
-    scoping: &Scoping,
-    source_type: SourceType,
-    options: &CompressOptions,
-) -> bool {
-    source_type.is_module() && removal_enabled(scoping, options)
+/// This is present for every ES module: export observability also protects
+/// count-based optimizations when recursive function removal is disabled.
+pub struct SymbolReachability<'a> {
+    externally_observable: BitSet<'a>,
+    functions: Option<FunctionGraph<'a>>,
 }
 
-// ========================================================================
-// Propagation: worklist over the flat edge list (rule 1)
-// ========================================================================
+impl<'a> SymbolReachability<'a> {
+    pub fn new(
+        source_type: SourceType,
+        options: &CompressOptions,
+        scoping: &Scoping,
+        allocator: &'a Allocator,
+    ) -> Option<Self> {
+        if !source_type.is_module() {
+            return None;
+        }
+        let symbols_len = scoping.symbols_len();
+        let functions = (options.unused != CompressOptionsUnused::Keep)
+            .then(|| FunctionGraph::new(scoping, allocator));
+        Some(Self { externally_observable: BitSet::new_in(symbols_len, allocator), functions })
+    }
 
-/// Worklist propagation shared by the standalone walk and the in-pass
-/// collection. The flat edge list sorted by source symbol is the adjacency
-/// "map": a live symbol's targets are one `partition_point` range scan away.
-/// Roots are already marked live (record-time dedup); marking non-candidate
-/// targets live is harmless — only candidates are consulted for deadness.
-fn propagate(
-    candidates: &BitSet<'_>,
-    live: &mut BitSet<'_>,
-    worklist: &mut ArenaVec<'_, SymbolId>,
-    edges: &mut ArenaVec<'_, (SymbolId, SymbolId)>,
-) {
-    edges.sort_unstable_by_key(|&(from, _)| from.index());
-    while let Some(symbol_id) = worklist.pop() {
-        // Only candidates have outgoing edges by construction.
-        if !candidates.contains(symbol_id.index()) {
-            continue;
-        }
-        let start = edges.partition_point(|&(from, _)| from.index() < symbol_id.index());
-        for &(from, target) in &edges[start..] {
-            if from != symbol_id {
-                break;
-            }
-            if !live.contains(target.index()) {
-                live.set_bit(target.index());
-                worklist.push(target);
-            }
-        }
+    #[inline]
+    pub fn is_externally_observable(&self, symbol_id: SymbolId) -> bool {
+        self.externally_observable.contains(symbol_id.index())
+    }
+
+    #[inline]
+    pub fn function_is_dead(&self, symbol_id: SymbolId) -> bool {
+        self.functions.as_ref().is_some_and(|graph| graph.is_dead(symbol_id))
+    }
+
+    fn mark_externally_observable(&mut self, symbol_id: SymbolId) {
+        self.externally_observable.set_bit(symbol_id.index());
+    }
+
+    fn register_function(&mut self, function: &Function<'_>) {
+        let Some(graph) = &mut self.functions else { return };
+        let Some(symbol_id) = function.id.as_ref().and_then(|id| id.symbol_id.get()) else {
+            return;
+        };
+        let Some(scope_id) = function.scope_id.get() else { return };
+        graph.register(scope_id, symbol_id);
+    }
+
+    fn analyze(&mut self, scoping: &Scoping) -> bool {
+        let Some(graph) = &mut self.functions else { return false };
+        graph.analyze(scoping, &self.externally_observable)
+    }
+
+    #[cfg(debug_assertions)]
+    fn dead_functions(&self) -> Option<&BitSet<'a>> {
+        self.functions.as_ref().map(|graph| &graph.dead)
     }
 }
 
-// ========================================================================
-// Collection: rides Normalize and every peephole pass (rule 3)
-// ========================================================================
-
-/// Per-pass in-traversal liveness collection: the peephole `Traverse` hooks
-/// record candidates, roots, and edges as the pass visits each node, so no
-/// standalone walk is needed to refresh the dead set. All buffers are
-/// `clear()`-reused across passes.
-pub struct LivenessCollect<'a> {
-    /// Collection is running this pass. Set at `enter_program` from
-    /// [`collection_enabled`]; stable for the whole pass, so every hook's
-    /// enter/exit pair is balanced.
-    active: bool,
-    /// Candidates admitted this pass (per-site gates at enter time, on the
-    /// pre-fold shape — folds only purify, so this under-approves relative
-    /// to the settled tree: the sound direction, self-correcting next pass).
+/// Stable candidate metadata, the published result, and one private set of
+/// allocation buffers reused by `analyze`.
+struct FunctionGraph<'a> {
     candidates: BitSet<'a>,
-    /// Marked at record time for roots, during propagation for edge targets.
-    live: BitSet<'a>,
-    /// Deduplicated roots; doubles as the propagation worklist.
-    roots: ArenaVec<'a, SymbolId>,
-    /// `(innermost enclosing candidate, referenced candidate-kind symbol)`.
-    edges: ArenaVec<'a, (SymbolId, SymbolId)>,
-    /// Saved `current_candidate` values; one frame per FUNCTION node,
-    /// pushed at enter, popped at exit. Only functions open regions —
-    /// classes and declarators just pin (their hooks push no frame).
-    frames: ArenaVec<'a, Option<SymbolId>>,
-    /// Innermost candidate whose deferred region the traversal is inside.
-    current_candidate: Option<SymbolId>,
-    /// Scratch for the next dead set; swapped with
-    /// `MinifierState::dead_symbols` at flush.
-    dead_next: BitSet<'a>,
-    /// Scratch for the next PINNED set; swapped with
-    /// `MinifierState::pinned_symbols` at flush. A pin is a force-root that
-    /// also survives the reference-COUNT removal arm (the module doc's
-    /// Rule 2 explains why rooting alone is not enough).
-    pinned_next: BitSet<'a>,
-    /// Symbols this pass's collection may have under-observed, force-rooted
-    /// at the flush; see the module doc's Rule 3 for the one producer (a
-    /// bound reference minted behind the traversal cursor). Cleared every
-    /// pass.
-    force_root_log: ArenaVec<'a, SymbolId>,
+    /// Direct mapping only. Owner lookup walks the current semantic parent
+    /// chain, so scopes inserted or reparented after Normalize remain correct.
+    function_by_scope: IndexVec<ScopeId, Option<SymbolId>>,
+    dead: BitSet<'a>,
+    scratch: GraphScratch<'a>,
 }
 
-impl<'a> LivenessCollect<'a> {
-    /// Everything starts zero-capacity (like `MinifierState::dead_symbols`):
-    /// the first ACTIVE `reset_for_pass` sizes the bitsets, so a compile with
-    /// the analysis off (`unused: Keep`, root direct eval) never allocates.
-    pub fn new(allocator: &'a Allocator) -> Self {
+impl<'a> FunctionGraph<'a> {
+    fn new(scoping: &Scoping, allocator: &'a Allocator) -> Self {
+        let symbols_len = scoping.symbols_len();
+        let mut function_by_scope = IndexVec::with_capacity(scoping.scopes_len());
+        function_by_scope.resize_with(scoping.scopes_len(), || None);
         Self {
-            active: false,
-            candidates: BitSet::new_in(0, allocator),
-            live: BitSet::new_in(0, allocator),
+            candidates: BitSet::new_in(symbols_len, allocator),
+            function_by_scope,
+            dead: BitSet::new_in(symbols_len, allocator),
+            scratch: GraphScratch::new(symbols_len, allocator),
+        }
+    }
+
+    fn register(&mut self, scope_id: ScopeId, symbol_id: SymbolId) {
+        self.candidates.set_bit(symbol_id.index());
+        self.function_by_scope[scope_id] = Some(symbol_id);
+    }
+
+    #[inline]
+    fn is_dead(&self, symbol_id: SymbolId) -> bool {
+        self.dead.contains(symbol_id.index())
+    }
+
+    fn owner(&self, scoping: &Scoping, scope_id: ScopeId) -> Option<SymbolId> {
+        scoping
+            .scope_ancestors(scope_id)
+            .find_map(|scope_id| self.function_by_scope.get(scope_id).copied().flatten())
+    }
+
+    fn analyze(&mut self, scoping: &Scoping, externally_observable: &BitSet<'_>) -> bool {
+        if scoping.root_scope_flags().contains_direct_eval() {
+            // The minifier may remove direct eval, but must never form one.
+            // Therefore a graph already carrying dead functions cannot become
+            // disabled later without violating the existing direct-eval guard.
+            debug_assert!(self.dead.is_empty(), "direct eval formed after liveness was published");
+            self.dead.clear();
+            return false;
+        }
+
+        self.scratch.reset();
+
+        for bit in externally_observable.ones() {
+            if self.candidates.contains(bit) {
+                self.scratch.mark_live_root(SymbolId::from_usize(bit));
+            }
+        }
+
+        for bit in self.candidates.ones() {
+            let target = SymbolId::from_usize(bit);
+            for &reference_id in scoping.get_resolved_reference_ids(target) {
+                let reference = scoping.get_reference(reference_id);
+                if let Some(owner) = self.owner(scoping, reference.scope_id()) {
+                    self.scratch.edges.push((owner, target));
+                } else {
+                    self.scratch.mark_live_root(target);
+                }
+            }
+        }
+
+        self.scratch.propagate(&self.candidates);
+
+        for bit in self.candidates.ones() {
+            if !self.scratch.live.contains(bit) {
+                self.scratch.next_dead.set_bit(bit);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        for bit in self.dead.ones() {
+            assert!(
+                self.scratch.next_dead.contains(bit),
+                "function liveness resurrected dead symbol {bit}; transforms must not create a \
+                 new path to a previously unreachable binding",
+            );
+        }
+
+        let found_new_dead = self.scratch.next_dead.ones().any(|bit| !self.dead.contains(bit));
+        std::mem::swap(&mut self.dead, &mut self.scratch.next_dead);
+        found_new_dead
+    }
+}
+
+struct GraphScratch<'a> {
+    live: BitSet<'a>,
+    roots: ArenaVec<'a, SymbolId>,
+    edges: ArenaVec<'a, (SymbolId, SymbolId)>,
+    next_dead: BitSet<'a>,
+}
+
+impl<'a> GraphScratch<'a> {
+    fn new(symbols_len: usize, allocator: &'a Allocator) -> Self {
+        Self {
+            live: BitSet::new_in(symbols_len, allocator),
             roots: ArenaVec::new_in(&allocator),
             edges: ArenaVec::new_in(&allocator),
-            frames: ArenaVec::new_in(&allocator),
-            current_candidate: None,
-            dead_next: BitSet::new_in(0, allocator),
-            pinned_next: BitSet::new_in(0, allocator),
-            force_root_log: ArenaVec::new_in(&allocator),
+            next_dead: BitSet::new_in(symbols_len, allocator),
         }
     }
 
-    fn reset_for_pass(&mut self, active: bool, symbols_len: usize, allocator: &'a Allocator) {
-        self.active = active;
-        self.current_candidate = None;
-        self.frames.clear();
-        // A pass observes rewrites made DURING it; anything already in the
-        // log predates this pass's traversal, which will visit those
-        // references as part of the tree. Cleared even when inactive so the
-        // log stays bounded with the analysis off.
-        self.force_root_log.clear();
-        if !active {
-            return;
-        }
+    fn reset(&mut self) {
+        self.live.clear();
         self.roots.clear();
         self.edges.clear();
-        // Symbols minted mid-pass are past these capacities and read as
-        // live everywhere (the `PassDirty::dead_refs` convention); their
-        // declarations enter the analysis next pass.
-        for bits in
-            [&mut self.candidates, &mut self.live, &mut self.dead_next, &mut self.pinned_next]
-        {
-            if bits.capacity() == symbols_len {
-                bits.clear();
-            } else {
-                *bits = BitSet::new_in(symbols_len, allocator);
-            }
-        }
+        self.next_dead.clear();
     }
 
-    /// Force-root `symbol_id` at this pass's flush; see the
-    /// `force_root_log` field doc.
-    /// No-op while collection is off (the flush would discard the entry
-    /// anyway), so minting call sites need no gate of their own.
-    pub fn log_force_root(&mut self, symbol_id: SymbolId) {
-        if self.active {
-            self.force_root_log.push(symbol_id);
-        }
-    }
-
-    /// Mark a symbol live and enqueue it for propagation; deduplicated at
-    /// record time.
     fn mark_live_root(&mut self, symbol_id: SymbolId) {
-        let index = symbol_id.index();
-        if index < self.live.capacity() && !self.live.has_bit(index) {
-            self.live.set_bit(index);
+        let bit = symbol_id.index();
+        if !self.live.contains(bit) {
+            self.live.set_bit(bit);
             self.roots.push(symbol_id);
         }
     }
 
-    /// Force-root a symbol AND pin it against the reference-count removal
-    /// arm; see the module doc's Rule 2 for why rooting alone is not
-    /// enough, and `MinifierState::pinned_symbols` for the consumer side.
-    fn pin_live_root(&mut self, symbol_id: SymbolId) {
-        self.mark_live_root(symbol_id);
-        let index = symbol_id.index();
-        if index < self.pinned_next.capacity() {
-            self.pinned_next.set_bit(index);
-        }
-    }
-
-    /// Admit a candidacy-eligible declaration; refuses mid-pass-minted
-    /// symbols (past capacity — they read as live and retry next pass).
-    fn admit_candidate(&mut self, symbol_id: SymbolId) -> bool {
-        let index = symbol_id.index();
-        if index < self.candidates.capacity() {
-            self.candidates.set_bit(index);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// `Traverse::enter_program` body for both collecting traversals —
-/// `Normalize` (whose collection produces the initial dead set for pass 1)
-/// and every peephole pass: reset the collection for the pass.
-pub fn begin_pass(ctx: &mut TraverseCtx<'_>) {
-    let allocator = ctx.allocator();
-    let TraverseCtx { state, scoping, .. } = ctx;
-    let enabled = collection_enabled(scoping.scoping(), state.source_type, &state.options);
-    let symbols_len = scoping.scoping().symbols_len();
-    state.liveness.reset_for_pass(enabled, symbols_len, allocator);
-}
-
-/// `Traverse::enter_identifier_reference` body. Runs for every
-/// `IdentifierReference` (including assignment targets), so the inactive
-/// path is one load and branch.
-pub fn collect_identifier_reference<'a>(
-    ident: &IdentifierReference<'a>,
-    ctx: &mut TraverseCtx<'a>,
-) {
-    let TraverseCtx { state, scoping, .. } = ctx;
-    let lv = &mut state.liveness;
-    if !lv.active {
-        return;
-    }
-    let scoping = scoping.scoping();
-    let Some(reference_id) = ident.reference_id.get() else { return };
-    let Some(symbol_id) = scoping.get_reference(reference_id).symbol_id() else { return };
-    // Kind-based edge-vs-root: a reference to a candidate-kind target inside
-    // a deferred region is an edge whether or not the target is admitted
-    // this pass — its candidacy bit lands via its own declaration hook in
-    // the same pass, so a newly-eligible dead symbol is found at this very
-    // flush. References to every other kind (locals, parameters, imports,
-    // classes) earn no storage at all.
-    if !scoping.symbol_flags(symbol_id).intersects(CANDIDATE_KINDS) {
-        return;
-    }
-    match lv.current_candidate {
-        None => lv.mark_live_root(symbol_id),
-        Some(from) => lv.edges.push((from, symbol_id)),
-    }
-}
-
-fn parent_is_export(parent: Ancestor<'_, '_>) -> bool {
-    matches!(
-        parent,
-        Ancestor::ExportNamedDeclarationDeclaration(_)
-            | Ancestor::ExportDefaultDeclarationDeclaration(_)
-    )
-}
-
-/// `Traverse::enter_function` body: decide candidacy at the same position
-/// the removal site evaluates (the hook fires before the function's scope is
-/// entered, so `current_scope_id` is the containing scope — identical to the
-/// `exit_statement` frame that runs `remove_unused_function_declaration`),
-/// and open the function's deferred region. The only position failure a
-/// module can express is an export wrapper: importers observe the binding,
-/// so it PINS instead of becoming a candidate.
-pub fn collect_enter_function<'a>(func: &Function<'a>, ctx: &mut TraverseCtx<'a>) {
-    if !ctx.state.liveness.active {
-        return;
-    }
-    let mut candidate = None;
-    if func.is_declaration()
-        && let Some(symbol_id) = func.id.as_ref().and_then(|id| id.symbol_id.get())
-    {
-        if parent_is_export(ctx.parent()) {
-            ctx.state.liveness.pin_live_root(symbol_id);
-        } else if ctx.state.liveness.admit_candidate(symbol_id) {
-            candidate = Some(symbol_id);
-        }
-    }
-    let lv = &mut ctx.state.liveness;
-    lv.frames.push(lv.current_candidate);
-    if candidate.is_some() {
-        lv.current_candidate = candidate;
-    }
-}
-
-/// `Traverse::enter_class` body. Classes are never candidates (see the
-/// module doc), but an export-wrapped class still PINS: importers observe
-/// the binding while removing a dead function cycle can zero its
-/// reference count.
-pub fn collect_enter_class<'a>(class: &Class<'a>, ctx: &mut TraverseCtx<'a>) {
-    if !ctx.state.liveness.active {
-        return;
-    }
-    if class.is_declaration()
-        && let Some(symbol_id) = class.id.as_ref().and_then(|id| id.symbol_id.get())
-        && parent_is_export(ctx.parent())
-    {
-        ctx.state.liveness.pin_live_root(symbol_id);
-    }
-}
-
-/// `Traverse::enter_variable_declarator` body. Declarators are never
-/// candidates (see the module doc), but bindings whose observability the
-/// reference count cannot express still pin, because removing a dead
-/// function cycle can zero their counts: an export-wrapped declaration
-/// (importers observe the binding through a sibling `export var f;`), and
-/// for-in/of heads and `using` declarators (no removal site handles them;
-/// their survival must not depend on counts). All of these are STABLE
-/// properties of the declaration — no rewrite can grant or revoke them
-/// mid-pass.
-pub fn collect_enter_variable_declarator<'a>(
-    decl: &VariableDeclarator<'a>,
-    ctx: &mut TraverseCtx<'a>,
-) {
-    if !ctx.state.liveness.active {
-        return;
-    }
-    let grandparent = ctx.ancestor(1);
-    let stable_position_fail = decl.kind.is_using()
-        || grandparent.is_parent_of_for_statement_left()
-        || matches!(grandparent, Ancestor::ExportNamedDeclarationDeclaration(_));
-    if stable_position_fail {
-        // Stable-position site: PIN every symbol it binds (see the module
-        // doc), destructuring included.
-        let lv = &mut ctx.state.liveness;
-        decl.id.bound_names(&mut |ident| {
-            if let Some(symbol_id) = ident.symbol_id.get() {
-                lv.pin_live_root(symbol_id);
+    fn propagate(&mut self, candidates: &BitSet<'_>) {
+        self.edges.sort_unstable_by_key(|&(from, _)| from.index());
+        while let Some(symbol_id) = self.roots.pop() {
+            if !candidates.contains(symbol_id.index()) {
+                continue;
             }
-        });
-    }
-}
-
-/// `Traverse::exit_function` body: close the region frame the enter hook
-/// opened. Functions are the only region-openers — classes and declarators
-/// only pin, so they need no exit hook.
-pub fn collect_exit_function(ctx: &mut TraverseCtx<'_>) {
-    let lv = &mut ctx.state.liveness;
-    if lv.active {
-        debug_assert!(!lv.frames.is_empty(), "unbalanced liveness region frames");
-        lv.current_candidate = lv.frames.pop().flatten();
-    }
-}
-
-/// Consume the pass's collection: force-root symbols that received freshly
-/// minted references (the one toward-dead divergence of in-pass collection),
-/// propagate liveness, refresh `MinifierState::dead_symbols`, and report
-/// whether the driver must run another pass: a NEW dead symbol appeared,
-/// and its removal must be consumed with the same one-pass freshness as
-/// everything else. Convergence is bounded by dead-set growth alone — dead
-/// bits only ever come from the symbol table, and a quiet re-run of an
-/// unchanged tree finds no new ones.
-///
-/// Must run after `flush_pass_dirty` so the debug ground-truth walk sees
-/// post-flush scoping.
-pub fn propagate_collected<'a>(
-    #[cfg_attr(not(debug_assertions), expect(unused_variables))] program: &Program<'a>,
-    ctx: &mut TraverseCtx<'a>,
-) -> bool {
-    let needs_liveness_pass = {
-        let TraverseCtx { state, scoping, .. } = ctx;
-        let scoping = scoping.scoping();
-        let crate::state::MinifierState { liveness: lv, dead_symbols, pinned_symbols, .. } = state;
-        if !lv.active {
-            return false;
-        }
-        debug_assert!(lv.frames.is_empty(), "unbalanced liveness region frames at flush");
-
-        // References minted behind the traversal cursor were never visited
-        // by the collection and must stay live this flush (see the
-        // `force_root_log` field doc).
-        while let Some(symbol_id) = lv.force_root_log.pop() {
-            lv.mark_live_root(symbol_id);
-        }
-
-        let found_new_dead = if lv.candidates.is_empty() {
-            // No candidates admitted ⇒ no edges (an edge needs an enclosing
-            // candidate region) and no dead set: skip the worklist drain and
-            // set scan (mirrors `compute_dead_symbols`' early-out).
-            false
-        } else {
-            // Candidacy is fully known post-collection, so drop the edges whose
-            // targets were never admitted (exported functions,
-            // function-expression names) before they hit the sort — such a
-            // target can never be dead. A removed edge's only effect was a live
-            // mark on a non-candidate, which nothing consults.
-            {
-                let LivenessCollect { edges, candidates, .. } = &mut *lv;
-                edges.retain(|&(_, target)| candidates.contains(target.index()));
-            }
-
-            propagate(&lv.candidates, &mut lv.live, &mut lv.roots, &mut lv.edges);
-
-            for candidate in lv.candidates.ones() {
-                if !lv.live.contains(candidate) {
-                    lv.dead_next.set_bit(candidate);
+            let start = self.edges.partition_point(|&(from, _)| from.index() < symbol_id.index());
+            for &(from, target) in &self.edges[start..] {
+                if from != symbol_id {
+                    break;
+                }
+                let bit = target.index();
+                if !self.live.contains(bit) {
+                    self.live.set_bit(bit);
+                    self.roots.push(target);
                 }
             }
-
-            // Per-bit scan; a word-level set-difference helper would make this
-            // O(words) — a possible `oxc_allocator` follow-up. Until then, gate
-            // the common terminal-pass case (empty dead set).
-            !lv.dead_next.is_empty() && lv.dead_next.ones().any(|bit| !dead_symbols.contains(bit))
-        };
-
-        // A stale pin may have vetoed a count-based removal during this pass.
-        // If the settled tree no longer demands that pin, run once more when
-        // the symbol can still have a waiting consumer: a remaining reference,
-        // or another declaration site. The latter is reachable for a `var`
-        // symbol shared by a removed for-in/of head and a surviving sibling
-        // declaration. A released sole-site pin needs no extra traversal.
-        let pins_released = pinned_symbols.ones().any(|bit| {
-            if lv.pinned_next.contains(bit) {
-                return false;
-            }
-            let symbol_id = SymbolId::from_usize(bit);
-            !scoping.get_resolved_reference_ids(symbol_id).is_empty()
-                || !scoping.symbol_redeclarations(symbol_id).is_empty()
-        });
-        found_new_dead || pins_released
-    };
-
-    #[cfg(debug_assertions)]
-    validate_flush(program, ctx);
-
-    let crate::state::MinifierState { liveness: lv, dead_symbols, pinned_symbols, .. } =
-        &mut ctx.state;
-    std::mem::swap(dead_symbols, &mut lv.dead_next);
-    std::mem::swap(pinned_symbols, &mut lv.pinned_next);
-    needs_liveness_pass
-}
-
-/// Debug-only flush validation, before the swaps: the fresh sets are still
-/// in [`LivenessCollect`], the consumed sets still in `MinifierState`.
-/// Three nets, two of them behind the dead-set gate (their checks are
-/// vacuous when this pass marked nothing dead), so the whole test and
-/// conformance corpus doubles as a collection-vs-truth differ at zero
-/// release cost.
-#[cfg(debug_assertions)]
-fn validate_flush<'a>(program: &Program<'a>, ctx: &TraverseCtx<'a>) {
-    let lv = &ctx.state.liveness;
-    let scoping = ctx.scoping();
-    if !lv.dead_next.is_empty() {
-        let (walk_dead, walk_candidates, walk_pins) =
-            compute_dead_symbols(program, scoping, &ctx.state.options, ctx.allocator());
-        // Ground-truth net: everything the in-pass collection calls dead
-        // must be dead per a standalone walk of the settled tree — for
-        // symbols whose declarations still exist (a declaration removed
-        // this pass legitimately lingers in the stale set for one flush,
-        // with nothing left to remove).
-        for bit in lv.dead_next.ones() {
-            assert!(
-                !walk_candidates.contains(bit) || walk_dead.contains(bit),
-                "in-pass liveness collection marked symbol {bit} dead but the ground-truth walk \
-                 sees it live",
-            );
-        }
-        // Pin net: every pin the settled tree demands must have been
-        // collected. A missed pin is SILENT wrong code — the count arm
-        // deletes an observable binding while the dead set stays perfectly
-        // correct — so no dead-set check can catch it; this is the one
-        // direction the net above cannot see.
-        for bit in walk_pins.ones() {
-            assert!(
-                lv.pinned_next.contains(bit),
-                "collection failed to pin symbol {bit} (`{}`) that the ground-truth walk pins",
-                scoping.symbol_name(SymbolId::from_usize(bit)),
-            );
         }
     }
-    // The CONTRACT itself, on the settled tree: nothing this pass consumed
-    // as dead may still have a declaration standing. Unlike the walk above,
-    // this re-derives nothing, so it cannot inherit a wrong shared
-    // predicate.
-    debug_assert_dead_declarations_removed(program, scoping, &ctx.state.dead_symbols);
+}
+
+/// Normalize hook: register stable function-declaration candidacy metadata.
+pub fn register_function(function: &Function<'_>, ctx: &mut TraverseCtx<'_>) {
+    if !function.is_declaration() {
+        return;
+    }
+    if let Some(reachability) = &mut ctx.state.symbol_reachability {
+        reachability.register_function(function);
+    }
+}
+
+/// Normalize hook: record runtime bindings exposed by a named export.
+pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut TraverseCtx<'_>) {
+    if ctx.state.symbol_reachability.is_none() {
+        return;
+    }
+
+    if !declaration.export_kind.is_type()
+        && let Some(inner) = &declaration.declaration
+    {
+        let reachability = ctx.state.symbol_reachability.as_mut().unwrap();
+        inner.bound_names(&mut |ident| {
+            if let Some(symbol_id) = ident.symbol_id.get() {
+                reachability.mark_externally_observable(symbol_id);
+            }
+        });
+    }
+
+    if declaration.source.is_some() || declaration.export_kind.is_type() {
+        return;
+    }
+
+    for specifier in &declaration.specifiers {
+        if specifier.export_kind.is_type() {
+            continue;
+        }
+        let ModuleExportName::IdentifierReference(local) = &specifier.local else { continue };
+        let Some(reference_id) = local.reference_id.get() else { continue };
+        let symbol_id = {
+            let reference = ctx.scoping().get_reference(reference_id);
+            (!reference.flags().is_type_only()).then(|| reference.symbol_id()).flatten()
+        };
+        if let Some(symbol_id) = symbol_id
+            && let Some(reachability) = &mut ctx.state.symbol_reachability
+        {
+            reachability.mark_externally_observable(symbol_id);
+        }
+    }
+}
+
+/// Normalize hook: record the local binding of a named default function or
+/// class declaration. `export default identifier` is intentionally excluded:
+/// it exports the evaluated value, not subsequent writes to that local binding.
+pub fn register_default_export(
+    declaration: &ExportDefaultDeclaration<'_>,
+    ctx: &mut TraverseCtx<'_>,
+) {
+    let symbol_id = match &declaration.declaration {
+        ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+            function.id.as_ref().and_then(|id| id.symbol_id.get())
+        }
+        ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+            class.id.as_ref().and_then(|id| id.symbol_id.get())
+        }
+        _ => None,
+    };
+    if let Some(symbol_id) = symbol_id
+        && let Some(reachability) = &mut ctx.state.symbol_reachability
+    {
+        reachability.mark_externally_observable(symbol_id);
+    }
+}
+
+/// Analyze the settled semantic reference lists and publish the next dead set.
+/// Called only after `flush_pass_dirty`.
+pub fn analyze<'a>(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
+    let _ = program;
+    #[cfg(debug_assertions)]
+    if let Some(dead) =
+        ctx.state.symbol_reachability.as_ref().and_then(SymbolReachability::dead_functions)
+    {
+        debug_assert_dead_function_declarations_removed(program, ctx.scoping(), dead);
+    }
+
+    let TraverseCtx { state, scoping, .. } = ctx;
+    state
+        .symbol_reachability
+        .as_mut()
+        .is_some_and(|reachability| reachability.analyze(scoping.scoping()))
+}
+
+/// Debug contract for the set consumed by the completed pass: graph deadness
+/// is used only at function-declaration sites, and every such site must be gone.
+#[cfg(debug_assertions)]
+fn debug_assert_dead_function_declarations_removed(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    dead: &BitSet<'_>,
+) {
+    if dead.is_empty() {
+        return;
+    }
+    DeadFunctionSweep { scoping, dead }.visit_program(program);
+}
+
+#[cfg(debug_assertions)]
+struct DeadFunctionSweep<'s, 'd, 'a> {
+    scoping: &'s Scoping,
+    dead: &'d BitSet<'a>,
+}
+
+#[cfg(debug_assertions)]
+impl<'a> Visit<'a> for DeadFunctionSweep<'_, '_, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        if function.is_declaration()
+            && let Some(symbol_id) = function.id.as_ref().and_then(|id| id.symbol_id.get())
+        {
+            assert!(
+                !self.dead.contains(symbol_id.index()),
+                "dead function `{}` survived the pass that consumed its liveness bit",
+                self.scoping.symbol_name(symbol_id),
+            );
+        }
+        walk_function(self, function, flags);
+    }
 }

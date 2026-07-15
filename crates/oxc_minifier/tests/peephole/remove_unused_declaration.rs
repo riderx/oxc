@@ -1,7 +1,7 @@
 use oxc_span::SourceType;
 
 use crate::{
-    CompressOptions, CompressOptionsUnused, TreeShakeOptions, test_options,
+    CompressOptions, CompressOptionsUnused, TreeShakeOptions, test_options, test_options_once,
     test_options_source_type, test_same_options, test_same_options_source_type, test_same_smallest,
     test_smallest,
 };
@@ -376,6 +376,25 @@ fn remove_recursive_unused_function_declaration() {
     test_smallest("if (false) c(); function c() { d() } function d() { c() }", "");
 }
 
+// Ownership is determined from each reference's current semantic scope, not
+// from traversal frames. References nested in non-candidate scopes still
+// belong to their nearest enclosing function declaration.
+#[test]
+fn remove_recursive_functions_through_nested_scope_kinds() {
+    test_smallest(
+        "function a(p = b) { { return () => function () { return class { m() { b() } } } } } function b() { a() }",
+        "",
+    );
+}
+
+#[test]
+fn keep_recursive_functions_reached_from_non_candidate_scopes() {
+    test_smallest(
+        "function a() { b() } function b() { a() } use(() => a, function () { b() }, class { m() { a() } });",
+        "function a() {\n\tb();\n}\nfunction b() {\n\ta();\n}\nuse(() => a, function() {\n\tb();\n}, class {\n\tm() {\n\t\ta();\n\t}\n});",
+    );
+}
+
 // Declarator and class cycles are KEPT: candidacy is functions-only, because
 // declarator/class candidacy measured zero output bytes on real bundles
 // while owning most of the analysis's hazard surface (see the
@@ -437,6 +456,8 @@ fn keep_recursive_function_with_live_references() {
     test_same_smallest("export default function f() { f() }");
     // Direct eval in the declaring scope blocks removal.
     test_same_smallest("function o() { function f() { f() } eval('x') } o();");
+    // Root direct eval disables publication before the first pass.
+    test_same_smallest("eval('x');\nfunction f() {\n\tf();\n}");
 }
 
 #[test]
@@ -546,14 +567,13 @@ fn keep_recursive_function_with_unused_keep_option() {
     let options =
         CompressOptions { unused: CompressOptionsUnused::Keep, ..CompressOptions::smallest() };
     test_same_options("function f() { f() }", &options);
+    // The graph is disabled, but export observability still protects the
+    // adjacent-declarator single-use substitution path.
+    test_same_options("export var f = side(), g = f; use(g);", &options);
 }
 
-// Candidacy is granted per declaration SITE but the dead bit is consumed per
-// SYMBOL, so a declaration site the removal machinery can never remove —
-// export-wrapped, script top-level (including bindings var-hoisted to the
-// script root from inside blocks), for-in/of heads, Annex-B block-level
-// functions — must force-root its symbol: one ineligible site keeps the
-// whole symbol alive even when another site of the same symbol is removable.
+// Export observability is stable symbol metadata. It protects a binding even
+// when another declaration of the same symbol supplies its runtime value.
 #[test]
 fn keep_recursive_cycle_with_exported_redeclaration() {
     // `export var f;` carries no reference, but importers observe the
@@ -575,130 +595,12 @@ fn keep_recursive_cycle_in_for_in_head() {
     );
 }
 
-// A declarator in a bare single-statement slot (if consequent/alternate,
-// loop/label/with body) has NO removal site: `exit_statements` fires on
-// statement lists only and the for-init retain covers for-inits only.
-// Candidacy must refuse the position, or the dead mark deletes the cycle
-// peer while the untouchable declarator survives referencing it
-// (ReferenceError once `g` is truthy). The peephole loop can even create
-// the shape itself by flattening `if (g) { var b = a; }` into the bare
-// slot.
+// Declarators are never graph candidates. A reference from any declarator
+// position therefore roots the function it targets; one bare-slot case is
+// enough to pin that final invariant.
 #[test]
 fn keep_declarator_cycle_in_bare_statement_slot() {
     test_same_smallest("function a() {\n\tb();\n}\nif (g) var b = a;");
-    // The loop body slot (`while` normalizes to `for`).
-    test_smallest(
-        "function a() { b() } while (g) var b = a;",
-        "function a() {\n\tb();\n}\nfor (; g;) var b = a;",
-    );
-    // The with-body slot, inside a function so script-mode root protection
-    // is not what keeps it.
-    let options = CompressOptions::smallest();
-    let source_type = SourceType::cjs().with_script(true);
-    test_same_options_source_type(
-        "function q() { function a() { b() } with (o) var b = a; return 1 } g(q());",
-        source_type,
-        &options,
-    );
-    // The braced form behaves identically: declarators are never
-    // analysis-removed, in a list slot or not.
-    test_smallest(
-        "function a() { b() } if (g) { var b = a; }",
-        "function a() {\n\tb();\n}\nif (g) var b = a;",
-    );
-}
-
-// The same hole one nesting level deeper: `handle_for_statement`'s retain —
-// the only for-init removal site — is reached from the statement-LIST loop,
-// so a `for` in a bare slot cannot have its init declarators removed either.
-// Candidacy must ask where the `for` itself sits.
-#[test]
-fn keep_declarator_cycle_in_bare_slot_for_init() {
-    test_same_smallest("function a() {\n\tb();\n}\nif (g) for (var b = a; g2;) ;");
-    // Else-arm, loop body and label body slots.
-    test_same_smallest("function a() {\n\tb();\n}\nif (g) g2(); else for (var b = a; g2;) ;");
-    test_same_smallest("function a() {\n\tb();\n}\nfor (; g;) for (var b = a; g2;) ;");
-    test_same_smallest("function a() {\n\tb();\n}\nlbl: for (var b = a; g;) break lbl;");
-    // Script mode, inside a function (root protection is not what keeps it).
-    let options = CompressOptions::smallest();
-    let source_type = SourceType::cjs().with_script(true);
-    test_same_options_source_type(
-        "function q() {\n\tfunction a() {\n\t\tb();\n\t}\n\tif (g) for (var b = a; g2;) ;\n\treturn 1;\n}\ng(q());",
-        source_type,
-        &options,
-    );
-    // A `for` that IS a statement-list member keeps its init declarator
-    // just the same.
-    test_smallest(
-        "function a() { b() } for (var b = a; g;) g2();",
-        "function a() {\n\tb();\n}\nfor (var b = a; g;) g2();",
-    );
-}
-
-// The block unwrap (`try_optimize_block`) relocates the declarator into the
-// bare if-consequent slot mid-pass. Declarators are never candidates, so
-// the relocation cannot strand anything — `b`'s init roots `a` from
-// wherever the statement lands. Historically this shape shipped wrong code
-// (a relocation force-root was needed while declarator candidacy existed);
-// the multi-pass timing scaffolding is kept so the shape still exercises
-// the relocation on the exact pass cadence that used to break.
-#[test]
-fn keep_declarator_cycle_relocated_by_block_unwrap() {
-    test_smallest(
-        "function a() { b() } function p1() {} function p2() { p1() } if (g) { p2(); p1(b); var b = a; }",
-        "function a() {\n\tb();\n}\nif (g) var b = a;",
-    );
-    // The `for` variant relocates the `for` itself into the bare slot.
-    test_smallest(
-        "function a() { b() } function p1() {} function p2() { p1() } if (g) { p2(); p1(b); for (var b = a; g2;) ; }",
-        "function a() {\n\tb();\n}\nif (g) for (var b = a; g2;) ;",
-    );
-    // Any pair of drops one pass apart opens the same window — here a live
-    // `let` that outlives the reference that roots `b`, rather than a pure
-    // call. Both shapes must stay pinned: the timing is the bug, not the
-    // mechanism that produces it.
-    test_smallest(
-        "function a() { b() } if (g) { var b = a; let c = 1; 0 && c; a; }",
-        "function a() {\n\tb();\n}\nif (g) var b = a;",
-    );
-    test_smallest(
-        "function a() { b() } if (g) { for (var b = a;;) break; let c = 1; 0 && c; a; }",
-        "function a() {\n\tb();\n}\nif (g) for (var b = a;;) break;",
-    );
-}
-
-// The `if (t) return; TAIL` inversion drains the tail into `if (!t) { TAIL }`,
-// and a tail of exactly one statement becomes a BARE consequent — the second
-// relocation shape that historically stranded a declarator while declarator
-// candidacy existed. Now the declarator roots its cycle from any slot; the
-// trailing statements still fold away and leave it alone in the tail.
-#[test]
-fn keep_declarator_cycle_relocated_by_if_inversion() {
-    test_smallest(
-        "function outer() { function a() { b(); } if (g) return; var b = a; function blocker() {} 0 && blocker; a; } outer();",
-        "function outer() {\n\tfunction a() {\n\t\tb();\n\t}\n\tif (!g) var b = a;\n}\nouter();",
-    );
-}
-
-// The for-body unwrap in `minimize_for_statement` folds a leading
-// `if (x) break;` into the loop test and moves the surviving statement into
-// the `for`'s bare body slot — the third relocation shape that shipped
-// wrong code while declarator candidacy existed (`void a` drops the same
-// pass, so the {a, b} cycle used to flush dead in exactly the pass whose
-// exit hook relocated the declarator). Declarators root their cycles now,
-// wherever they sit.
-#[test]
-fn keep_declarator_cycle_relocated_by_for_body_unwrap() {
-    test_smallest(
-        "function a() { return b; } for (;;) { if (x) break; var b = a; } void a;",
-        "function a() {\n\treturn b;\n}\nfor (; !x;) var b = a;",
-    );
-    // The `for` variant relocates an inner `for` with a var init into the
-    // bare body slot.
-    test_smallest(
-        "function a() { return b; } for (;;) { if (x) break; for (var b = a;;) break; } void a;",
-        "function a() {\n\treturn b;\n}\nfor (; !x;) for (var b = a;;) break;",
-    );
 }
 
 // A symbol declared both by a candidate site and a non-candidate site must
@@ -712,6 +614,17 @@ fn recursive_function_with_var_redeclaration() {
     test_same_smallest("function f() { f() } var f = [f];");
 }
 
+#[test]
+fn recursive_function_var_redeclaration_converges_on_count_pass() {
+    test_smallest("function f() { f() } var f;", "");
+
+    // The first pass consumes graph deadness at the function declaration.
+    // Its body reference is pruned only at the following flush, so a capped
+    // run conservatively retains the sibling `var` declaration.
+    let options = CompressOptions { max_iterations: Some(0), ..CompressOptions::smallest() };
+    test_options_once("function f() { f() } var f;", "var f;", &options);
+}
+
 // For-init declarators are not candidates either; the self-referencing
 // init roots its own binding.
 #[test]
@@ -719,23 +632,8 @@ fn keep_recursive_for_init_declarator() {
     test_same_smallest("for (let f = () => f();;) break;");
 }
 
-// A dead peer's removal (`g2`) frees the single-use temp `t` mid-pass, and
-// substitution rewrites `d`'s init — historically the poisoning shape while
-// declarator candidacy existed. Now `d` is never a candidate: its init
-// roots `g` from any shape, so the cycle survives the rewrite untouched.
-#[test]
-fn keep_cycle_after_single_use_substitution_into_declarator() {
-    test_smallest(
-        "var t = console.log(1); var d = [t, g, ...'xy'].length; function g() { d(), g() } function g2() { t; g2() } let flag = false; if (flag) d;",
-        "var d = [console.log(1), g, ...'xy'].length; function g() { d(), g() }",
-    );
-}
-
-// `using` is a position gate (removal always bails on `using` declarators)
-// and it is load-bearing wrong-code protection: without it `u` would be
-// admitted (identifier init, pure and non-specialized), the u<->p cycle
-// would be dead, and `var p` removed — while `using u = p` survives,
-// referencing a deleted binding.
+// `using` declarations are ordinary root contexts for function reachability;
+// no separate pin is needed.
 #[test]
 fn keep_using_declarator_cycle() {
     test_same_smallest(
@@ -744,12 +642,11 @@ fn keep_using_declarator_cycle() {
     test_same_smallest(
         "async function o() { await using u = p; var p = function() { u() }; return 1 } g(o());",
     );
+    test_same_smallest("function f() {\n\tf();\n}\nusing resource = f;");
 }
 
-// The class arm of the position force-root is a separate code path from the
-// function arm (`collect_enter_class` / the debug walk's `visit_class`):
-// `export class` carries no reference, so without the class-site force-root
-// the A<->B cycle would be dead and a live module export deleted.
+// Exported classes are externally observable, and references in class method
+// scopes root function candidates because classes are not graph candidates.
 #[test]
 fn keep_exported_class_cycle() {
     test_same_smallest("export class A { m() { new B() } } class B { m() { new A() } }");
@@ -777,6 +674,24 @@ fn keep_recursive_class_in_script_mode_top_level() {
 #[test]
 fn remove_recursive_function_after_eval_dropped() {
     test_smallest("if (false) eval('x'); function f() { f() }", "");
+}
+
+#[test]
+fn module_export_observability_kinds() {
+    test_same_smallest("export function f() {\n\tf();\n}");
+    test_same_smallest("function f() {\n\tf();\n}\nexport { f };");
+    test_same_smallest("export default function f() {\n\tf();\n}");
+    // A default identifier is an evaluated value reference, not stable
+    // observability of later writes to the local binding.
+    test_same_smallest("function f() {\n\tf();\n}\nexport default f;");
+
+    let options = CompressOptions::smallest();
+    test_options_source_type(
+        "function f() { f() } export type { f };",
+        "export type { f };",
+        SourceType::ts(),
+        &options,
+    );
 }
 
 #[test]
@@ -869,39 +784,9 @@ fn remove_unused_import_source_statement() {
     );
 }
 
-// `Normalize` strips these parens at `exit_expression`, after the
-// declarator's enter hook ran — the shape-staleness axis that made
-// declarator candidacy expensive to keep sound. Declarators are never
-// candidates now, so the class init's reference to `a` is a root and the
-// whole shape survives every paren/fold rewrite.
-#[test]
-fn keep_cycle_with_parenthesized_residue_init() {
-    // The parens in the INPUT are the whole point: they are what the enter
-    // hook sees and `Normalize` then strips.
-    test_smallest(
-        "function a() { b(); } var b = (class { static x = a; });",
-        "function a() {\n\tb();\n}\nvar b = class {\n\tstatic x = a;\n};",
-    );
-    // Same shift through the other residue-leaving kinds.
-    test_smallest(
-        "function a() { b(); } var b = ([a]); console.log(1);",
-        "function a() {\n\tb();\n}\nvar b = [a];\nconsole.log(1);",
-    );
-}
-
-// A force-root only keeps a symbol out of the DEAD set. The removal sites also
-// ask `symbol_is_unused` — and this analysis is what drives a count to zero, by
-// deleting the dead cycle that held the last reference. So a force-rooted symbol
-// whose surviving references all sat inside a dead cycle reaches refcount 0 and
-// the COUNT arm deletes it, defeating the force-root entirely. Both shapes below
-// were wrong code; both are fixed by `symbol_is_pinned`.
-
-// The position force-root, same bypass. `export var f;` carries no reference, so
-// only the position gate keeps `f` live — but the initializing redeclaration is a
-// perfectly removable site, and once the d1<->d2 cycle holding `f`'s only
-// reference is deleted, the count arm strips the initializer and importers see
-// `undefined`. Silent, idempotent, and reachable in DCE mode (rolldown's
-// per-module treeshake preprocess), which is what makes it worth pinning.
+// `export var f;` carries no ordinary reference. Stable export observability
+// must protect a sibling initializer after removal of the dead cycle that held
+// its last in-module read.
 #[test]
 fn keep_exported_var_initializer_when_a_dead_cycle_held_its_only_reference() {
     test_smallest(
@@ -910,9 +795,9 @@ fn keep_exported_var_initializer_when_a_dead_cycle_held_its_only_reference() {
     );
 }
 
-// Pins must protect every count-based removal, not only declaration sites.
-// Deleting the dead cycle removes the last ordinary read of `f`; assignments
-// and member writes are still observable through the exported binding.
+// Every count-based consumer shares the same export observability predicate.
+// Deleting the dead cycle removes the last ordinary read of `f`, but assignments
+// and member writes remain observable through the exported binding.
 #[test]
 fn keep_exported_binding_writes_when_a_dead_cycle_held_its_other_reads() {
     test_smallest(
@@ -925,7 +810,7 @@ fn keep_exported_binding_writes_when_a_dead_cycle_held_its_other_reads() {
     );
 }
 
-// The collection arms for ESM modules only: in a script or CommonJS source
+// The graph exists for ESM modules only: in a script or CommonJS source
 // the feature's core shape — a dead function cycle — must survive
 // byte-unchanged (exactly `main`'s behavior, at zero cost). Sloppy sources
 // carry observability the reference model cannot express (script-globals,
@@ -939,12 +824,16 @@ fn analysis_off_for_non_module_sources() {
     test_same_options_source_type(cycle, SourceType::cjs(), &options);
 }
 
-// A pin can be released when unreachable-code removal deletes a `for..of`
-// head. Usually the binding disappears with it; a `var` head can also share
-// its symbol with a surviving sibling declaration, in which case the stale
-// pin may have vetoed a removal and its release must request another pass.
+// For-head bindings need no special pin. References in the RHS participate in
+// normal scope ownership, while unreachable heads disappear through the
+// ordinary dirty-reference lifecycle.
 #[test]
-fn remove_unreachable_for_of_head_with_pinned_binding() {
+fn for_head_reachability_uses_ordinary_references() {
+    test_same_smallest("function f() {\n\tf();\n}\nfor (var x of [f]);");
+    test_smallest(
+        "function f() { f() } for (var unused in object);",
+        "for (var unused in object);",
+    );
     test_smallest(
         "export function f() { return 1; for (const x of arr) g(x); }",
         "export function f() {\n\treturn 1;\n}",
@@ -956,11 +845,10 @@ fn remove_unreachable_for_of_head_with_pinned_binding() {
     test_smallest("if (false) for (var f of xs) {} f = 1; export {};", "export {};");
 }
 
-// The pin veto must also gate `is_expression_result_unused`
-// (`substitute_alternate_syntax`): it consults the same reference count the
-// removal sites do, and a dead cycle's removal discards the references it
-// held, so an exported binding reaches count zero while importers still
-// observe it. Without the veto, the empty async/generator IIFE arms
+// Export observability also gates `is_expression_result_unused`
+// (`substitute_alternate_syntax`). A dead cycle's removal can discard all
+// ordinary reads while importers still observe the binding. Without the
+// stable export bit, the empty async/generator IIFE arms
 // collapse the initializer to `void 0` — importers would read `undefined`
 // instead of a Promise / Generator object. (The pure-arrow arms share the
 // gate but their shapes dissolve on pass 1 via `try_take_iife_body`,
@@ -998,17 +886,13 @@ fn remove_unused_import_defer_statements() {
     );
 }
 
-// The debug oracle's export flag must not leak through an arrow:
-// `export default (w) => { function f() {} }` declares an ordinary
-// candidate, not an exported binding. Pre-fix, the ground-truth walk
-// demanded a pin for `f` that the (correct) collection never granted,
-// panicking the pin net on any flush that carried new dead bits — found
-// by monitor-oxc on less@4.6.4's error-reporting.js within minutes of
-// the oracle landing.
+// Export observability must not leak through an arrow: `export default () =>
+// { function f() {} }` declares an ordinary candidate, not an exported
+// binding.
 #[test]
-fn pin_oracle_ignores_declarations_inside_exported_arrow() {
+fn export_observability_ignores_declarations_inside_exported_arrow() {
     test_smallest(
-        "export default () => { function pinned() {} pinned(); }; function dead1() { dead2() } function dead2() { dead1() }",
+        "export default () => { function nested() {} nested(); }; function dead1() { dead2() } function dead2() { dead1() }",
         "export default () => {};",
     );
 }

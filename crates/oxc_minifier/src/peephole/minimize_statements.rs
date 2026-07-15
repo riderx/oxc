@@ -1463,10 +1463,11 @@ impl<'a> PeepholeOptimizations {
             else {
                 return true;
             };
-            // Count-based removal is blocked for exported or liveness-pinned
-            // bindings. An `export { foo }` specifier also contributes a
-            // reference, so it fails the single-read check below.
-            if symbol_value.count_based_removal_blocked
+            // Exported bindings remain observable outside this module. An
+            // `export { foo }` specifier also contributes a reference, but
+            // consult the shared metadata explicitly for consistency with
+            // the other count-based consumers.
+            if ctx.state.symbol_is_externally_observable(prev_decl_id.symbol_id())
                 || symbol_value.read_references_count > 1
                 || symbol_value.write_references_count > 0
             {

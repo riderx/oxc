@@ -573,17 +573,10 @@ impl<'a> PeepholeOptimizations {
         let is_null_symbol_id =
             ctx.scoping().get_reference(is_null_id_ref.reference_id()).symbol_id();
 
-        // These mints happen behind the traversal cursor, so the liveness
-        // collection never visits them: log them for force-rooting at the
-        // flush (`LivenessCollect::force_root_log`), as every minting call
-        // site must.
-        for symbol_id in [typeof_symbol_id, is_null_symbol_id].into_iter().flatten() {
-            ctx.state.liveness.log_force_root(symbol_id);
-        }
-
         // Plain `clone_in` resets every `reference_id` to `None`, making id
-        // aliasing structurally impossible; the loop below installs the one
-        // fresh reference the clone needs.
+        // aliasing structurally impossible. The fresh references below are
+        // stamped with the current scope, so the next post-flush graph
+        // analysis observes them directly from scoping.
         let mut new_left_expr = typeof_binary_expr.clone_in(ctx.allocator());
         if let Expression::BinaryExpression(new_left_expr_binary) = &mut new_left_expr {
             new_left_expr_binary.operator =
@@ -1911,8 +1904,8 @@ impl<'a> PeepholeOptimizations {
     }
 
     /// Whether the expression's result will be discarded — bare expression
-    /// statement, or the init of a `var`/`let`/`const` whose binding has no
-    /// references and isn't exported. Used by the IIFE inliner to short-circuit
+    /// statement, or the init of a `var`/`let`/`const` whose binding is unused
+    /// by count. Used by the IIFE inliner to short-circuit
     /// pure-annotated IIFEs to `void 0` so they drop regardless of body shape,
     /// and to allow `(async () => {})()` / `(function* () {})()` (whose return
     /// value isn't a meaningful result) to collapse in those positions too.
@@ -1931,35 +1924,10 @@ impl<'a> PeepholeOptimizations {
                 let BindingPattern::BindingIdentifier(ident) = decl.id() else {
                     return false;
                 };
-                // The shared predicate, not a raw count: a pinned binding
-                // (e.g. the sibling of an `export var f;`) reaches count
-                // zero when a dead cycle's removal discards its references,
-                // and without the pin veto the IIFE arms above would
-                // collapse an exported initializer to `void 0`.
-                if !Self::symbol_has_no_live_references(ident.symbol_id(), ctx) {
-                    return false;
-                }
-                !Self::var_declaration_is_exported(ctx)
+                Self::symbol_is_unused_by_count(ident.symbol_id(), ctx)
             }
             _ => false,
         }
-    }
-
-    /// `true` if the `VariableDeclaration` that contains the current expression
-    /// (entered via `VariableDeclaratorInit`) sits directly under an `export`
-    /// wrapper. Exports are cross-module reachable, and the inner
-    /// `VariableDeclaration` never routes through `handle_variable_declaration`
-    /// — dropping its init would silently break the export's runtime value.
-    ///
-    /// Checks the exact ancestor slot above `VariableDeclaration` only;
-    /// walking the full chain would over-broaden the guard to function-local
-    /// vars inside exported functions.
-    fn var_declaration_is_exported(ctx: &TraverseCtx<'a>) -> bool {
-        // Only `ExportNamedDeclaration`'s `declaration` field can hold a
-        // `VariableDeclaration`. `export default` wraps a function / class /
-        // expression — never a `VariableDeclaration` — so no arm is needed
-        // for it.
-        matches!(ctx.ancestors().nth(2), Some(Ancestor::ExportNamedDeclarationDeclaration(_)))
     }
 
     /// Optimizes the usage of Immediately Invoked Function Expressions (IIFEs)

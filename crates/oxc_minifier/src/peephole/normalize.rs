@@ -52,50 +52,33 @@ impl<'a> Normalize {
 }
 
 impl<'a> Traverse<'a> for Normalize {
-    fn enter_program(&mut self, _node: &mut Program<'a>, ctx: &mut TraverseCtx<'a>) {
-        // Normalize's traversal doubles as the first liveness collection
-        // pass, replacing a standalone pre-loop walk. See `symbol_liveness`.
-        symbol_liveness::begin_pass(ctx);
-    }
-
     fn exit_program(&mut self, node: &mut Program<'a>, _ctx: &mut TraverseCtx<'a>) {
         if self.options.remove_unnecessary_use_strict && node.source_type.is_module() {
             node.directives.drain_filter(|d| d.directive.as_str() == "use strict");
         }
     }
 
-    // Liveness-collection delegations — keep this set in sync with the
-    // identical one in `PeepholeOptimizations` (both traversals collect;
-    // the membership is part of the analysis contract, see the
-    // `symbol_liveness` module doc). Normalize's mutations during
-    // collection only diverge toward-live (drops were already visited;
-    // mints are logged at the choke point and force-rooted at flush).
-    fn enter_identifier_reference(
-        &mut self,
-        node: &mut IdentifierReference<'a>,
-        ctx: &mut TraverseCtx<'a>,
-    ) {
-        symbol_liveness::collect_identifier_reference(node, ctx);
-    }
-
+    // Normalize is the only metadata-building traversal. Function candidacy
+    // and export observability are stable; every later analysis derives edges
+    // and roots from post-flush semantic references.
     fn enter_function(&mut self, node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        symbol_liveness::collect_enter_function(node, ctx);
+        symbol_liveness::register_function(node, ctx);
     }
 
-    fn exit_function(&mut self, _node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        symbol_liveness::collect_exit_function(ctx);
-    }
-
-    fn enter_class(&mut self, node: &mut Class<'a>, ctx: &mut TraverseCtx<'a>) {
-        symbol_liveness::collect_enter_class(node, ctx);
-    }
-
-    fn enter_variable_declarator(
+    fn enter_export_named_declaration(
         &mut self,
-        node: &mut VariableDeclarator<'a>,
+        node: &mut ExportNamedDeclaration<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        symbol_liveness::collect_enter_variable_declarator(node, ctx);
+        symbol_liveness::register_named_export(node, ctx);
+    }
+
+    fn enter_export_default_declaration(
+        &mut self,
+        node: &mut ExportDefaultDeclaration<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        symbol_liveness::register_default_export(node, ctx);
     }
 
     fn exit_statements(

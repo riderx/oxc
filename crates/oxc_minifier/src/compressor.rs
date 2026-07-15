@@ -117,12 +117,11 @@ impl<'a> Compressor<'a> {
         let initial_references_len = ctx.get_mut().scoping().references_len();
         // Consume the drops Normalize recorded (`void x` -> `void 0`,
         // drop_console), so pass 1 already observes the pruned reference
-        // counts and Normalize's drops cost no extra peephole pass. Its
-        // traversal also doubled as the first liveness collection (see
-        // `symbol_liveness::begin_pass`), so the same end-of-pass sequence
-        // makes source-level dead cycles (`function f() { f() }`) visible
-        // to pass 1 — no standalone walk anywhere. The continue signal is
-        // irrelevant pre-loop: the loop below always runs at least once.
+        // counts and Normalize's drops cost no extra peephole pass. Normalize
+        // also registered function declarations and exports, so post-flush
+        // analysis makes source-level dead cycles (`function f() { f() }`)
+        // visible to pass 1. The continue signal is irrelevant pre-loop: the
+        // loop below always runs at least once.
         PeepholeOptimizations::end_pass(program, ctx.get_mut());
         // Start the loop from a clean signal: Normalize's drops are flushed
         // above, so a Normalize-only mutation must not force a pointless
@@ -131,19 +130,14 @@ impl<'a> Compressor<'a> {
         loop {
             PeepholeOptimizations.run_once(program, ctx);
             let mutated = ctx.state_mut().take_mutated();
-            // Flush and consume the liveness collection even on quiet
-            // passes (every flush step is a cheap no-op then): pass N's
-            // late mutations can kill a cycle that only pass N+1's —
-            // otherwise quiet — collection observes. Stopping without
-            // consuming it would strand the removal; deferring consumption
-            // to the fixed point was measured to LOSE output (other passes
-            // rewrite late-exposed dead cycles into non-candidate shapes),
-            // so one-pass staleness is the freshness contract.
+            // Flush and recompute liveness even on quiet passes: pass N's
+            // late mutations can expose a cycle only after its removed
+            // references have been pruned from scoping. Stopping before this
+            // post-flush analysis would strand the declaration.
             let needs_liveness_pass = PeepholeOptimizations::end_pass(program, ctx.get_mut());
             // Convergence: another pass is demanded only for a NEW dead
-            // symbol (bounded by the symbol table — see
-            // `propagate_collected`); the iteration cap backstops
-            // pathological churn.
+            // function (bounded by the candidate set); the iteration cap
+            // backstops pathological churn.
             if !mutated && !needs_liveness_pass {
                 break;
             }
