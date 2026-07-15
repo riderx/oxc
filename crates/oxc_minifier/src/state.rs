@@ -106,9 +106,10 @@ pub struct MinifierState<'a> {
     /// the incremental scoping refresh.
     pub(crate) dirty: PassDirty<'a>,
 
-    /// Module export observability plus the optional recursive-function graph.
-    /// Normalize records stable declaration metadata once; post-flush analysis
-    /// derives reachability from the current semantic reference lists.
+    /// Module exports and Script-global function observability plus the
+    /// optional recursive-function graph. Normalize records declaration
+    /// metadata once; post-flush analysis derives reachability from the current
+    /// semantic reference lists.
     pub(crate) symbol_reachability: Option<SymbolReachability<'a>>,
 
     /// Scratch buffer reused by `try_fold_concat` to build template literal
@@ -154,8 +155,8 @@ impl<'a> MinifierState<'a> {
         !self.dce || !self.options.treeshake.property_write_side_effects
     }
 
-    /// Whether another module can observe this binding even when there are no
-    /// references to it in the current module.
+    /// Whether code outside this AST can observe this binding even when there
+    /// are no resolved references to it in the current program.
     pub(crate) fn symbol_is_externally_observable(&self, symbol_id: SymbolId) -> bool {
         self.symbol_reachability
             .as_ref()

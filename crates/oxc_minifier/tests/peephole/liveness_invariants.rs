@@ -54,9 +54,10 @@ const MODULE_CASES: &[&str] = &[
     "function f() { f() } for (var item of [f]);",
 ];
 
-const OFF_PATH_CASES: &[&str] = &[
+const NON_ESM_CASES: &[&str] = &[
     "function a() { b() } function b() { a() } console.log('keep')",
     "function outer() { function f() { f() } return 1 } use(outer)",
+    "if (false) g(); function g() { f() } function f() { f() }",
 ];
 
 #[test]
@@ -67,7 +68,7 @@ fn liveness_repeat_compression_corpus() {
         }
     }
 
-    for source in OFF_PATH_CASES {
+    for source in NON_ESM_CASES {
         for source_type in [SourceType::cjs(), SourceType::cjs().with_script(true)] {
             for dce in [false, true] {
                 compress_twice(source, source_type, dce);

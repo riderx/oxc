@@ -122,7 +122,7 @@ impl<'a> Compressor<'a> {
         // analysis makes source-level dead cycles (`function f() { f() }`)
         // visible to pass 1. The continue signal is irrelevant pre-loop: the
         // loop below always runs at least once.
-        PeepholeOptimizations::end_pass(program, ctx.get_mut());
+        PeepholeOptimizations::end_pass(program, ctx.get_mut(), /* force_analysis */ true);
         // Start the loop from a clean signal: Normalize's drops are flushed
         // above, so a Normalize-only mutation must not force a pointless
         // extra iteration.
@@ -130,11 +130,14 @@ impl<'a> Compressor<'a> {
         loop {
             PeepholeOptimizations.run_once(program, ctx);
             let mutated = ctx.state_mut().take_mutated();
-            // Flush and recompute liveness even on quiet passes: pass N's
-            // late mutations can expose a cycle only after its removed
-            // references have been pruned from scoping. Stopping before this
-            // post-flush analysis would strand the declaration.
-            let needs_liveness_pass = PeepholeOptimizations::end_pass(program, ctx.get_mut());
+            // Flush every pass. Reachability is recomputed only when a removed
+            // reference belonged to a graph candidate (or direct eval was
+            // dropped); those are the only changes to its inputs.
+            let needs_liveness_pass = PeepholeOptimizations::end_pass(
+                program,
+                ctx.get_mut(),
+                /* force_analysis */ false,
+            );
             // Convergence: another pass is demanded only for a NEW dead
             // function (bounded by the candidate set); the iteration cap
             // backstops pathological churn.

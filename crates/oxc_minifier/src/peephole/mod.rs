@@ -400,8 +400,10 @@ impl<'a> PeepholeOptimizations {
     /// loop starts against already-pruned scoping and Normalize's drops cost
     /// no extra peephole pass) and after every peephole pass — quiet ones
     /// included, where every step below is a cheap no-op.
-    fn flush_pass_dirty(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) {
+    fn flush_pass_dirty(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
         let had_dead = !ctx.state.dirty.dead_refs.is_empty();
+        let needs_liveness_analysis = ctx.state.dirty.eval_dropped
+            || (had_dead && symbol_liveness::dead_references_affect_analysis(ctx));
 
         // (1) Resolved references — direct consumption, no walk.
         //     Dirty data is built by `replace_*` / `drop_*` helpers as
@@ -445,15 +447,20 @@ impl<'a> PeepholeOptimizations {
             ctx.state.dirty.dead_refs = BitSet::new_in(refs_len, ctx.allocator());
         }
         ctx.state.dirty.eval_dropped = false;
+        needs_liveness_analysis
     }
 
     /// End-of-pass sequence: flush the dirty accumulator into scoping, then
     /// derive function reachability from those settled semantic references.
     /// Keeping the pair together makes the ordering structural. Returns
     /// whether newly dead functions demand another pass.
-    pub(crate) fn end_pass(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
-        Self::flush_pass_dirty(program, ctx);
-        symbol_liveness::analyze(program, ctx)
+    pub(crate) fn end_pass(
+        program: &Program<'a>,
+        ctx: &mut TraverseCtx<'a>,
+        force_analysis: bool,
+    ) -> bool {
+        let graph_inputs_changed = Self::flush_pass_dirty(program, ctx);
+        symbol_liveness::analyze(program, ctx, force_analysis || graph_inputs_changed)
     }
 }
 

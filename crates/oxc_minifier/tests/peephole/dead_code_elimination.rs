@@ -39,6 +39,18 @@ fn test_same(source_text: &str) {
 }
 
 #[track_caller]
+fn test_source_type(source_text: &str, expected: &str, source_type: SourceType) {
+    let result = run(source_text, source_type, Some(CompressOptions::dce()));
+    let expected = run(expected, source_type, None);
+    assert_eq!(result, expected, "\nfor source\n{source_text}\nexpect\n{expected}\ngot\n{result}");
+}
+
+#[track_caller]
+fn test_same_source_type(source_text: &str, source_type: SourceType) {
+    test_source_type(source_text, source_text, source_type);
+}
+
+#[track_caller]
 fn test_with_options(source_text: &str, expected: &str, options: CompressOptions) {
     let source_type = SourceType::default();
     let result = run(source_text, source_type, Some(options));
@@ -799,4 +811,28 @@ fn dce_recursive_unused_functions() {
         "var f = 1; function d1() { f; d2() } function d2() { d1() } if (false) for (var f of xs) {} export {};",
         "export {};",
     );
+}
+
+#[test]
+fn dce_recursive_unused_functions_in_commonjs_and_script() {
+    test_source_type(
+        "function c() { d() } function d() { c() } console.log('k');",
+        "console.log('k');",
+        SourceType::cjs(),
+    );
+    test_source_type("{ function f() { f() } }", "", SourceType::cjs());
+    test_source_type(
+        "if (false) g(); function g() { f() } function f() { f() }",
+        "",
+        SourceType::cjs(),
+    );
+    test_source_type(
+        "function outer() { function c() { d() } function d() { c() } return 1 }",
+        "function outer() { return 1 }",
+        SourceType::script(),
+    );
+
+    test_same_source_type("function f() { f() }", SourceType::script());
+    test_same_source_type("{ function f() { f() } }", SourceType::script());
+    test_same_source_type("function f() { f() } module.exports = f;", SourceType::cjs());
 }

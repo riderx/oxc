@@ -570,6 +570,14 @@ fn keep_recursive_function_with_unused_keep_option() {
     // The graph is disabled, but export observability still protects the
     // adjacent-declarator single-use substitution path.
     test_same_options("export var f = side(), g = f; use(g);", &options);
+    // Non-ESM sources do not need observability metadata when their graph is
+    // disabled, but behavior remains identical.
+    test_same_options_source_type("function f() { f() }", SourceType::cjs(), &options);
+    test_same_options_source_type(
+        "function outer() { function f() { f() } }",
+        SourceType::script(),
+        &options,
+    );
 }
 
 // Export observability is stable symbol metadata. It protects a binding even
@@ -674,6 +682,31 @@ fn keep_recursive_class_in_script_mode_top_level() {
 #[test]
 fn remove_recursive_function_after_eval_dropped() {
     test_smallest("if (false) eval('x'); function f() { f() }", "");
+
+    let options = CompressOptions::smallest();
+    test_options_source_type(
+        "if (false) eval('x'); function f() { f() }",
+        "",
+        SourceType::cjs(),
+        &options,
+    );
+    test_options_source_type(
+        "function outer() { if (false) eval('x'); function f() { f() } return 1 }",
+        "function outer() { return 1 }",
+        SourceType::script(),
+        &options,
+    );
+}
+
+#[test]
+fn keep_non_module_recursive_functions_reachable_by_eval() {
+    let options = CompressOptions::smallest();
+    test_same_options_source_type("eval('f()'); function f() { f() }", SourceType::cjs(), &options);
+    test_same_options_source_type(
+        "function outer() { eval('f()'); function f() { f() } }",
+        SourceType::script(),
+        &options,
+    );
 }
 
 #[test]
@@ -810,18 +843,62 @@ fn keep_exported_binding_writes_when_a_dead_cycle_held_its_other_reads() {
     );
 }
 
-// The graph exists for ESM modules only: in a script or CommonJS source
-// the feature's core shape — a dead function cycle — must survive
-// byte-unchanged (exactly `main`'s behavior, at zero cost). Sloppy sources
-// carry observability the reference model cannot express (script-globals,
-// Annex B block-function aliases); enabling them is deliberate follow-up
-// work, and this test is the OFF-path proof until then.
 #[test]
-fn analysis_off_for_non_module_sources() {
+fn analyze_commonjs_and_script_local_functions() {
     let options = CompressOptions::smallest();
     let cycle = "function c() {\n\td();\n}\nfunction d() {\n\tc();\n}\nconsole.log(\"k\");";
-    test_same_options_source_type(cycle, SourceType::cjs().with_script(true), &options);
-    test_same_options_source_type(cycle, SourceType::cjs(), &options);
+    test_options_source_type(cycle, "console.log(\"k\");", SourceType::cjs(), &options);
+    test_options_source_type("{ function f() { f() } }", "", SourceType::cjs(), &options);
+    // `g` has only a root reference, so counts own its lifecycle. Once the
+    // false branch and then `g` disappear, dropping `g`'s body reference wakes
+    // the graph and exposes recursive `f`.
+    test_options_source_type(
+        "if (false) g(); function g() { f() } function f() { f() }",
+        "",
+        SourceType::cjs(),
+        &options,
+    );
+
+    // A strict block binding and bindings local to a function are not visible
+    // to later script tags.
+    test_options_source_type(
+        "\"use strict\"; { function f() { f() } }",
+        "\"use strict\";",
+        SourceType::script(),
+        &options,
+    );
+    test_options_source_type(
+        "function outer() { function c() { d() } function d() { c() } return 1 }",
+        "function outer() { return 1 }",
+        SourceType::script(),
+        &options,
+    );
+}
+
+#[test]
+fn keep_commonjs_exports_and_script_global_functions() {
+    let options = CompressOptions::smallest();
+    test_same_options_source_type(
+        "function f() { f() } module.exports = f;",
+        SourceType::cjs(),
+        &options,
+    );
+    test_same_options_source_type(
+        "function f() { f() } exports.f = f;",
+        SourceType::cjs(),
+        &options,
+    );
+
+    // Script-root declarations are visible to later script tags. Sloppy block
+    // functions are Annex B-hoisted to that same observable root binding.
+    test_same_options_source_type("function f() { f() }", SourceType::script(), &options);
+    test_same_options_source_type("{ function f() { f() } }", SourceType::script(), &options);
+    test_options_source_type(
+        "function f() {} function outer() { function d1() { console.log(f); d2() } function d2() { d1() } return 1 } f.x = 1;",
+        "function f() {} function outer() { return 1 } f.x = 1;",
+        SourceType::script(),
+        &options,
+    );
 }
 
 // For-head bindings need no special pin. References in the RHS participate in
