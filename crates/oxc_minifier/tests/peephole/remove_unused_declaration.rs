@@ -395,12 +395,37 @@ fn keep_recursive_functions_reached_from_non_candidate_scopes() {
     );
 }
 
-// Declarator and class cycles are KEPT: candidacy is functions-only, because
-// declarator/class candidacy measured zero output bytes on real bundles
-// while owning most of the analysis's hazard surface (see the
-// `symbol_liveness` module doc). These pin the deliberate keeps — the
-// declarators' interior references root their targets, so the whole shape
-// survives.
+#[test]
+fn remove_self_recursive_function_valued_declarators() {
+    test_smallest("var f = function() { f() };", "");
+    test_smallest("const f = () => f();", "");
+    test_smallest("let f = function(value = f()) {};", "");
+    test_smallest("let f = (value = f()) => value;", "");
+}
+
+#[test]
+fn keep_reachable_self_recursive_function_valued_declarators() {
+    test_same_smallest("const f = function() { f() }; use(f);");
+    test_same_smallest("let f = () => f(); f = other;");
+    test_same_smallest("export const f = () => f();");
+    test_same_smallest("const f = (effect(), () => f());");
+
+    // A script-level `var` is externally observable even when its declaration
+    // is nested in a block and visited from that block's scope.
+    test_options_source_type(
+        "{ var f = function() { f() } }",
+        "var f = function() { f() };",
+        SourceType::cjs().with_script(true),
+        &CompressOptions::smallest(),
+    );
+}
+
+// Mutual declarator and class cycles are KEPT: candidacy is function
+// declarations only, because general declarator/class candidacy measured zero
+// output bytes on real bundles while owning most of the analysis's hazard
+// surface (see the `symbol_liveness` module doc). These pin the deliberate
+// keeps — the declarators' interior references root their targets, so the
+// whole shape survives.
 #[test]
 fn keep_recursive_declarator_and_class_cycles() {
     // const arrow cycle.
@@ -408,8 +433,6 @@ fn keep_recursive_declarator_and_class_cycles() {
         "const a = () => b(); const b = () => a();",
         "const a = () => b(), b = () => a();",
     );
-    // var closing over its own binding.
-    test_same_smallest("var f = function() {\n\tf();\n};");
     // Class cycle with side-effect-free evaluation.
     test_same_smallest(
         "class A {\n\tm() {\n\t\tnew B();\n\t}\n}\nclass B {\n\tm() {\n\t\tnew A();\n\t}\n}",
@@ -422,19 +445,16 @@ fn keep_recursive_declarator_and_class_cycles() {
     );
 }
 
-// Future extension: the reachability graph currently admits function
-// declarations only. Keep the intended declarator behavior executable but
-// ignored until declarator sites can be analyzed and consumed safely.
+// Future extension: mutual declarator cycles need graph participation rather
+// than the removal-site-local check used for self-recursive initializers.
 #[test]
-#[ignore = "TODO: extend recursive reachability to variable declarators"]
-fn remove_recursive_unused_declarator_cycles() {
+#[ignore = "TODO: extend recursive reachability to mutual variable declarators"]
+fn remove_recursive_unused_mutual_declarator_cycles() {
     test_smallest("const a = () => b(); const b = () => a();", "");
-    test_smallest("var f = function() { f() };", "");
     test_smallest(
         "const a = () => b(), keep = 1; function b() { a() } console.log(keep);",
         "console.log(1);",
     );
-    test_smallest("for (let f = () => f();;) break;", "for (;;) break;");
 }
 
 // Future extension: class evaluation needs a stable removability proof before
@@ -594,6 +614,7 @@ fn keep_recursive_function_with_unused_keep_option() {
     let options =
         CompressOptions { unused: CompressOptionsUnused::Keep, ..CompressOptions::smallest() };
     test_same_options("function f() { f() }", &options);
+    test_same_options("const f = () => f()", &options);
     // The graph is disabled, but export observability still protects the
     // adjacent-declarator single-use substitution path.
     test_same_options("export var f = side(), g = f; use(g);", &options);
@@ -660,11 +681,11 @@ fn recursive_function_var_redeclaration_converges_on_count_pass() {
     test_options_once("function f() { f() } var f;", "var f;", &options);
 }
 
-// For-init declarators are not candidates either; the self-referencing
-// init roots its own binding.
+// A for initializer is an actual declarator removal site, so it can use the
+// same local self-reference check without becoming a graph candidate.
 #[test]
-fn keep_recursive_for_init_declarator() {
-    test_same_smallest("for (let f = () => f();;) break;");
+fn remove_self_recursive_for_init_declarator() {
+    test_smallest("for (let f = () => f();;) break;", "for (;;) break;");
 }
 
 // `using` declarations are ordinary root contexts for function reachability;

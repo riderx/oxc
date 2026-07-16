@@ -25,6 +25,42 @@ impl<'a> PeepholeOptimizations {
         Self::symbol_is_unused_by_count(symbol_id, ctx) || ctx.state.function_is_dead(symbol_id)
     }
 
+    /// Return `true` when an exact function-valued initializer contains every
+    /// reference to its own binding. Creating a function or arrow has no side
+    /// effects, and without a reference from outside that function it can
+    /// never be called.
+    ///
+    /// This check deliberately runs at the declarator removal site instead of
+    /// registering declarators in the recursive-function graph. That keeps
+    /// mutual declarator cycles unsupported, but also means statement
+    /// relocation cannot leave a dead candidate in a non-removable AST slot.
+    fn self_recursive_function_declarator_is_unused(
+        decl: &VariableDeclarator<'a>,
+        symbol_id: SymbolId,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
+        let Some(function_scope_id) = decl.init.as_ref().and_then(|init| match init {
+            Expression::FunctionExpression(function) => function.scope_id.get(),
+            Expression::ArrowFunctionExpression(arrow) => arrow.scope_id.get(),
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        if ctx.state.symbol_is_externally_observable(symbol_id)
+            || (ctx.source_type().is_script()
+                && ctx.scoping().symbol_scope_id(symbol_id) == ctx.scoping().root_scope_id())
+        {
+            return false;
+        }
+
+        ctx.scoping().get_resolved_references(symbol_id).all(|reference| {
+            ctx.scoping()
+                .scope_ancestors(reference.scope_id())
+                .any(|scope_id| scope_id == function_scope_id)
+        })
+    }
+
     fn is_sync_iterator_expr(expr: &Expression<'a>, ctx: &TraverseCtx<'a>) -> bool {
         match expr {
             Expression::ArrayExpression(_)
@@ -59,7 +95,10 @@ impl<'a> PeepholeOptimizations {
         match &decl.id {
             BindingPattern::BindingIdentifier(ident) => {
                 if let Some(symbol_id) = ident.symbol_id.get() {
-                    return Self::symbol_is_unused_by_count(symbol_id, ctx);
+                    return Self::symbol_is_unused_by_count(symbol_id, ctx)
+                        || Self::self_recursive_function_declarator_is_unused(
+                            decl, symbol_id, ctx,
+                        );
                 }
                 false
             }

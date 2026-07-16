@@ -785,12 +785,16 @@ fn dce_remove_unreachable_after_terminating_statement() {
 }
 
 // #13105: dead recursive/cyclic function declarations must also drop in
-// dce-only mode (rolldown's per-module treeshake preprocess). Declarator
-// and class cycles are kept because graph candidacy is functions-only.
+// dce-only mode (rolldown's per-module treeshake preprocess). Self-recursive
+// function-valued declarators use a local removal-site check; mutual
+// declarator and class cycles are kept because graph candidacy is function
+// declarations only.
 #[test]
 fn dce_recursive_unused_functions() {
     test("function f() { f() }", "");
     test("function c() { d() } function d() { c() }", "");
+    test("var f = function() { f() }", "");
+    test("const f = () => f()", "");
     // Cycle whose only external root sits in dead code: needs the mid-loop
     // recompute trigger (pass 2), not just the initial compute.
     test("if (false) c(); function c() { d() } function d() { c() }", "");
@@ -814,14 +818,15 @@ fn dce_recursive_unused_functions() {
 }
 
 #[test]
-#[ignore = "TODO: extend recursive reachability beyond function declarations"]
-fn dce_recursive_unused_declarators_and_classes() {
+#[ignore = "TODO: extend recursive reachability to mutual declarators and classes"]
+fn dce_recursive_unused_mutual_declarators_and_classes() {
     test("const a = () => b(); const b = () => a();", "");
     test("class A { m() { new B() } } class B { m() { new A() } }", "");
 }
 
 #[test]
 fn dce_recursive_unused_functions_in_commonjs_and_script() {
+    test_source_type("var f = function() { f() }", "", SourceType::cjs());
     test_source_type(
         "function c() { d() } function d() { c() } console.log('k');",
         "console.log('k');",
@@ -838,8 +843,14 @@ fn dce_recursive_unused_functions_in_commonjs_and_script() {
         "function outer() { return 1 }",
         SourceType::script(),
     );
+    test_source_type(
+        "function outer() { const f = () => f(); return 1 }",
+        "function outer() { return 1 }",
+        SourceType::script(),
+    );
 
     test_same_source_type("function f() { f() }", SourceType::script());
+    test_same_source_type("var f = () => f()", SourceType::script());
     test_same_source_type("{ function f() { f() } }", SourceType::script());
     test_same_source_type("function f() { f() } module.exports = f;", SourceType::cjs());
 }
