@@ -106,10 +106,10 @@ pub struct MinifierState<'a> {
     /// refresh.
     pub(crate) dirty: PassDirty<'a>,
 
-    /// Module exports and Script-global function observability plus the
-    /// optional recursive-function graph. Normalize records declaration
-    /// metadata once; post-flush analysis derives reachability from the current
-    /// semantic reference lists.
+    /// Module exports and Script-global binding observability plus the
+    /// optional recursive-function graph. Stable metadata is seeded from
+    /// scoping and Normalize; post-flush analysis derives reachability from the
+    /// current semantic reference lists.
     pub(crate) symbol_reachability: Option<SymbolReachability<'a>>,
 
     /// Scratch buffer reused by `try_fold_concat` to build template literal

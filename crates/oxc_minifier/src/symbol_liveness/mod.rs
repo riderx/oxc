@@ -16,7 +16,7 @@
 //!    nested in a candidate function is an edge from that function; every
 //!    other reference is a root.
 //! 3. **External observability** is stable metadata collected from module
-//!    exports and Script-root function bindings. It protects every count-based
+//!    exports and Script-root bindings. It protects every count-based
 //!    consumer, not only declaration removal, because code outside the current
 //!    program can observe a binding with no resolved references in this AST.
 //! 4. **Analysis runs after scoping is flushed.** Every result is derived from
@@ -51,9 +51,15 @@
 //! or wrapper. Script root bindings are visible to later scripts, so root
 //! function declarations are observability-only, not graph candidates; their
 //! body references naturally root local candidates. Local declarations inside
-//! Script functions and strict blocks can still be removed. Annex B block
-//! functions are safe because semantic binding hoists their symbol to the
-//! observable Script root when required.
+//! Script functions and strict blocks can still be removed. The first eligible
+//! Annex B declaration is hoisted to a var-scope symbol; any declaration left
+//! with a sloppy block-scoped symbol is excluded from registration below.
+//!
+//! Treating a count-dead non-candidate owner's body as unreachable requires
+//! that the declaration itself cannot execute without a resolved reference.
+//! Registration therefore excludes Script-root declarations and sloppy Annex
+//! B block functions whose runtime var-alias write is not fully represented by
+//! their block-scoped symbol.
 
 use oxc_allocator::{Allocator, BitSet, GetAllocator, Vec as ArenaVec};
 use oxc_ast::ast::*;
@@ -89,10 +95,16 @@ impl<'a> SymbolReachability<'a> {
             return None;
         }
         let symbols_len = scoping.symbols_len();
-        Some(Self {
-            externally_observable: BitSet::new_in(symbols_len, allocator),
-            functions: None,
-        })
+        let mut externally_observable = BitSet::new_in(symbols_len, allocator);
+        if source_type.is_script() {
+            let root_scope_id = scoping.root_scope_id();
+            for symbol_id in scoping.symbol_ids() {
+                if scoping.symbol_scope_id(symbol_id) == root_scope_id {
+                    externally_observable.set_bit(symbol_id.index());
+                }
+            }
+        }
+        Some(Self { externally_observable, functions: None })
     }
 
     #[inline]
@@ -121,8 +133,25 @@ impl<'a> SymbolReachability<'a> {
         };
         let Some(scope_id) = function.scope_id.get() else { return };
 
-        if source_type.is_script() && scoping.symbol_scope_id(symbol_id) == scoping.root_scope_id()
+        let binding_scope_id = scoping.symbol_scope_id(symbol_id);
+
+        // Annex B block functions also assign their function object to a
+        // var-like binding when the block executes. Semantic hoisting records
+        // that alias when possible, but duplicates and TypeScript declarations
+        // can retain a block-scoped symbol even though the runtime alias write
+        // still occurs. Such a declaration may therefore execute with no
+        // resolved reference to its own symbol and cannot participate in this
+        // graph.
+        let binding_scope_flags = scoping.scope_flags(binding_scope_id);
+        if !function.r#async
+            && !function.generator
+            && !binding_scope_flags.is_var()
+            && !binding_scope_flags.is_strict_mode()
         {
+            return;
+        }
+
+        if source_type.is_script() && binding_scope_id == scoping.root_scope_id() {
             self.mark_externally_observable(symbol_id);
             return;
         }
@@ -214,7 +243,9 @@ impl<'a> FunctionGraph<'a> {
                     if !self.candidates.contains(owner.index()) {
                         // A non-candidate owner is either permanently observable,
                         // reachable through a root reference, or count-dead.
-                        // Only the first two can make their body execute.
+                        // Only the first two can make their body execute; registration
+                        // excludes declarations whose runtime semantics violate that
+                        // count-dead implication.
                         if externally_observable.contains(owner.index())
                             || !scoping.symbol_is_unused(owner)
                         {

@@ -854,3 +854,34 @@ fn dce_recursive_unused_functions_in_commonjs_and_script() {
     test_same_source_type("{ function f() { f() } }", SourceType::script());
     test_same_source_type("function f() { f() } module.exports = f;", SourceType::cjs());
 }
+
+#[test]
+fn dce_keeps_sloppy_duplicate_block_functions() {
+    let source =
+        "{ function f() { return 1 } } { function f() { return f } } console.log(typeof f());";
+    for source_type in [SourceType::script(), SourceType::cjs()] {
+        test_same_source_type(source, source_type);
+    }
+    test_same_source_type(
+        "{ function f() { return f } } { function f() { return f } } console.log(typeof f());",
+        SourceType::ts().with_script(true),
+    );
+
+    // Strict block functions have no Annex B var alias and remain removable.
+    test_source_type("'use strict'; { function f() { f() } }", "'use strict';", SourceType::cjs());
+    test_source_type(
+        "'use strict'; { function f() { f() } }",
+        "'use strict';",
+        SourceType::ts().with_script(true),
+    );
+}
+
+#[test]
+fn dce_keeps_script_root_var_in_nested_statement_after_cycle_removed() {
+    let source = "function outer() { function d1() { return x + d2() } function d2() { return d1() } return 1 } outer(); switch (1) { case 1: var x = 42; }";
+    let expected = "function outer() { return 1 } switch (1) { case 1: var x = 42; }";
+    test_source_type(source, expected, SourceType::script());
+
+    // CommonJS top-level vars are wrapper-local, so ordinary counts may remove them.
+    test_source_type("{ var x = 42; }", "", SourceType::cjs());
+}

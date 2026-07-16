@@ -610,6 +610,46 @@ fn keep_recursive_function_in_script_mode_top_level() {
 }
 
 #[test]
+fn keep_sloppy_duplicate_block_functions() {
+    let options = CompressOptions::smallest();
+    let source =
+        "{ function f() { return 1 } } { function f() { return f } } console.log(typeof f());";
+    for source_type in [SourceType::script(), SourceType::cjs()] {
+        test_same_options_source_type(source, source_type, &options);
+    }
+    test_same_options_source_type(
+        "{ function f() { return f } } { function f() { return f } } console.log(typeof f());",
+        SourceType::ts().with_script(true),
+        &options,
+    );
+
+    // Strict block functions have no Annex B var alias and remain removable.
+    test_options_source_type(
+        "'use strict'; { function f() { f() } }",
+        "'use strict';",
+        SourceType::cjs(),
+        &options,
+    );
+    test_options_source_type(
+        "'use strict'; { function f() { f() } }",
+        "'use strict';",
+        SourceType::ts().with_script(true),
+        &options,
+    );
+}
+
+#[test]
+fn keep_script_root_var_in_nested_statement_after_cycle_removed() {
+    let options = CompressOptions::smallest();
+    let source = "function outer() { function d1() { return x + d2() } function d2() { return d1() } return 1 } outer(); switch (1) { case 1: var x = 42; }";
+    let expected = "function outer() { return 1 } switch (1) { case 1: var x = 42; }";
+    test_options_source_type(source, expected, SourceType::script(), &options);
+
+    // CommonJS top-level vars are wrapper-local, so ordinary counts may remove them.
+    test_options_source_type("{ var x = 42; }", "", SourceType::cjs(), &options);
+}
+
+#[test]
 fn keep_recursive_function_with_unused_keep_option() {
     let options =
         CompressOptions { unused: CompressOptionsUnused::Keep, ..CompressOptions::smallest() };
