@@ -106,10 +106,10 @@ pub struct MinifierState<'a> {
     /// refresh.
     pub(crate) dirty: PassDirty<'a>,
 
-    /// Module exports and Script-global binding observability plus the
-    /// optional recursive-function graph. Stable metadata is seeded from
-    /// scoping and Normalize; post-flush analysis derives reachability from the
-    /// current semantic reference lists.
+    /// Bindings observable without resolved references plus the optional
+    /// recursive-function graph. Stable metadata is seeded from scoping and
+    /// Normalize; post-flush analysis derives reachability from the current
+    /// semantic reference lists.
     pub(crate) symbol_reachability: Option<SymbolReachability<'a>>,
 
     /// Scratch buffer reused by `try_fold_concat` to build template literal
@@ -155,12 +155,15 @@ impl<'a> MinifierState<'a> {
         !self.dce || !self.options.treeshake.property_write_side_effects
     }
 
-    /// Whether code outside this AST can observe this binding even when there
-    /// are no resolved references to it in the current program.
-    pub(crate) fn symbol_is_externally_observable(&self, symbol_id: SymbolId) -> bool {
-        self.symbol_reachability
-            .as_ref()
-            .is_some_and(|reachability| reachability.is_externally_observable(symbol_id))
+    /// Whether runtime semantics can observe this binding even when there are
+    /// no resolved references to it in the current AST.
+    pub(crate) fn symbol_is_observable_without_resolved_references(
+        &self,
+        symbol_id: SymbolId,
+    ) -> bool {
+        self.symbol_reachability.as_ref().is_some_and(|reachability| {
+            reachability.is_observable_without_resolved_references(symbol_id)
+        })
     }
 
     /// Whether post-flush graph analysis proved a function declaration

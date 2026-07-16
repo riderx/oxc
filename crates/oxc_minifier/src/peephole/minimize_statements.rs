@@ -1458,11 +1458,11 @@ impl<'a> PeepholeOptimizations {
             else {
                 return true;
             };
-            // Exported bindings remain observable outside this module. An
-            // `export { foo }` specifier also contributes a reference, but
-            // consult the shared metadata explicitly for consistency with
-            // the other count-based consumers.
-            if ctx.state.symbol_is_externally_observable(prev_decl_id.symbol_id())
+            // Some bindings remain observable without a resolved reference.
+            // An `export { foo }` specifier also contributes a reference, but
+            // consult the shared metadata explicitly for consistency with the
+            // other count-based consumers.
+            if ctx.state.symbol_is_observable_without_resolved_references(prev_decl_id.symbol_id())
                 || symbol_value.read_references_count > 1
                 || symbol_value.write_references_count > 0
             {

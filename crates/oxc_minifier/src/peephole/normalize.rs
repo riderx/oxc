@@ -59,8 +59,8 @@ impl<'a> Traverse<'a> for Normalize {
     }
 
     // Normalize is the only metadata-building traversal. Function candidacy
-    // and export observability are stable; every later analysis derives edges
-    // and roots from post-flush semantic references.
+    // and reference-free observability are stable; every later analysis
+    // derives edges and roots from post-flush semantic references.
     fn enter_function(&mut self, node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
         symbol_liveness::register_function(node, ctx);
     }
@@ -100,6 +100,7 @@ impl<'a> Traverse<'a> for Normalize {
         decl: &mut VariableDeclaration<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
+        symbol_liveness::register_using_declaration(decl, ctx);
         if self.options.convert_const_to_let {
             Self::convert_const_to_let(decl, ctx);
         }

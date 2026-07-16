@@ -15,10 +15,11 @@
 //! 2. **Ownership** comes from semantic scopes. A reference whose scope is
 //!    nested in a candidate function is an edge from that function; every
 //!    other reference is a root.
-//! 3. **External observability** is stable metadata collected from module
-//!    exports and Script-root bindings. It protects every count-based
-//!    consumer, not only declaration removal, because code outside the current
-//!    program can observe a binding with no resolved references in this AST.
+//! 3. **Observability without resolved references** is stable metadata for
+//!    bindings whose runtime value can be observed even when this AST has no
+//!    resolved reference to them: module exports, Script-root bindings, Annex
+//!    B aliases, and `using` disposal. It protects every count-based consumer,
+//!    not only declaration removal.
 //! 4. **Analysis runs after scoping is flushed.** Every result is derived from
 //!    the settled resolved-reference lists, so AST rewrites need no parallel
 //!    collection hooks or behind-the-cursor repair log.
@@ -75,11 +76,13 @@ use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx};
 
 /// Stable program-wide symbol facts plus the optional recursive-function graph.
 ///
-/// This is always present for ES modules: export observability also protects
-/// count-based optimizations when recursive function removal is disabled. For
-/// CommonJS and Script sources it exists only when the function graph is used.
+/// This is always present for ES modules: exported-binding observability also
+/// protects count-based optimizations when recursive function removal is
+/// disabled. For CommonJS and Script sources it normally exists only when the
+/// function graph is used, but a `using` declaration creates it lazily because
+/// disposal observes its binding without an ordinary reference.
 pub struct SymbolReachability<'a> {
-    externally_observable: BitSet<'a>,
+    observable_without_resolved_references: BitSet<'a>,
     functions: Option<FunctionGraph<'a>>,
 }
 
@@ -94,22 +97,30 @@ impl<'a> SymbolReachability<'a> {
         if !source_type.is_module() && !functions_enabled {
             return None;
         }
+        Some(Self::with_observability(source_type, scoping, allocator))
+    }
+
+    fn with_observability(
+        source_type: SourceType,
+        scoping: &Scoping,
+        allocator: &'a Allocator,
+    ) -> Self {
         let symbols_len = scoping.symbols_len();
-        let mut externally_observable = BitSet::new_in(symbols_len, allocator);
+        let mut observable_without_resolved_references = BitSet::new_in(symbols_len, allocator);
         if source_type.is_script() {
             let root_scope_id = scoping.root_scope_id();
             for symbol_id in scoping.symbol_ids() {
                 if scoping.symbol_scope_id(symbol_id) == root_scope_id {
-                    externally_observable.set_bit(symbol_id.index());
+                    observable_without_resolved_references.set_bit(symbol_id.index());
                 }
             }
         }
-        Some(Self { externally_observable, functions: None })
+        Self { observable_without_resolved_references, functions: None }
     }
 
     #[inline]
-    pub fn is_externally_observable(&self, symbol_id: SymbolId) -> bool {
-        self.externally_observable.contains(symbol_id.index())
+    pub fn is_observable_without_resolved_references(&self, symbol_id: SymbolId) -> bool {
+        self.observable_without_resolved_references.contains(symbol_id.index())
     }
 
     #[inline]
@@ -117,8 +128,8 @@ impl<'a> SymbolReachability<'a> {
         self.functions.as_ref().is_some_and(|graph| graph.is_dead(symbol_id))
     }
 
-    fn mark_externally_observable(&mut self, symbol_id: SymbolId) {
-        self.externally_observable.set_bit(symbol_id.index());
+    fn mark_observable_without_resolved_references(&mut self, symbol_id: SymbolId) {
+        self.observable_without_resolved_references.set_bit(symbol_id.index());
     }
 
     fn register_function(
@@ -148,11 +159,14 @@ impl<'a> SymbolReachability<'a> {
             && !binding_scope_flags.is_var()
             && !binding_scope_flags.is_strict_mode()
         {
+            // The runtime Annex B alias may expose both the declaration and
+            // writes to it even after ordinary references disappear.
+            self.mark_observable_without_resolved_references(symbol_id);
             return;
         }
 
         if source_type.is_script() && binding_scope_id == scoping.root_scope_id() {
-            self.mark_externally_observable(symbol_id);
+            self.mark_observable_without_resolved_references(symbol_id);
             return;
         }
 
@@ -162,7 +176,7 @@ impl<'a> SymbolReachability<'a> {
 
     fn analyze(&mut self, scoping: &Scoping) -> bool {
         let Some(graph) = &mut self.functions else { return false };
-        graph.analyze(scoping, &self.externally_observable)
+        graph.analyze(scoping, &self.observable_without_resolved_references)
     }
 
     fn contains_candidate(&self, symbol_id: SymbolId) -> bool {
@@ -215,7 +229,11 @@ impl<'a> FunctionGraph<'a> {
             .find_map(|scope_id| self.function_by_scope.get(scope_id).copied().flatten())
     }
 
-    fn analyze(&mut self, scoping: &Scoping, externally_observable: &BitSet<'_>) -> bool {
+    fn analyze(
+        &mut self,
+        scoping: &Scoping,
+        observable_without_resolved_references: &BitSet<'_>,
+    ) -> bool {
         if scoping.root_scope_flags().contains_direct_eval() {
             // The minifier may remove direct eval, but must never form one.
             // Therefore a graph already carrying dead functions cannot become
@@ -227,7 +245,7 @@ impl<'a> FunctionGraph<'a> {
 
         self.scratch.reset();
 
-        for bit in externally_observable.ones() {
+        for bit in observable_without_resolved_references.ones() {
             if self.candidates.contains(bit) {
                 self.scratch.mark_live_root(SymbolId::from_usize(bit));
             }
@@ -246,14 +264,14 @@ impl<'a> FunctionGraph<'a> {
                         // Only the first two can make their body execute; registration
                         // excludes declarations whose runtime semantics violate that
                         // count-dead implication.
-                        if externally_observable.contains(owner.index())
+                        if observable_without_resolved_references.contains(owner.index())
                             || !scoping.symbol_is_unused(owner)
                         {
                             self.scratch.mark_live_root(target);
                         }
                         continue;
                     }
-                    if externally_observable.contains(owner.index()) {
+                    if observable_without_resolved_references.contains(owner.index()) {
                         // An edge from a permanently live function is itself a
                         // root. Avoid storing and sorting the common observable
                         // owner case while preserving the same result.
@@ -381,6 +399,30 @@ pub fn register_function(function: &Function<'_>, ctx: &mut TraverseCtx<'_>) {
     }
 }
 
+/// Normalize hook: record resource bindings observed later by explicit
+/// resource management. Disposal reads the bound value through runtime state,
+/// not through a resolved identifier reference in the AST.
+pub fn register_using_declaration(
+    declaration: &VariableDeclaration<'_>,
+    ctx: &mut TraverseCtx<'_>,
+) {
+    if !declaration.kind.is_using() {
+        return;
+    }
+
+    let source_type = ctx.state.source_type;
+    let allocator = ctx.allocator();
+    let TraverseCtx { state, scoping, .. } = ctx;
+    let reachability = state.symbol_reachability.get_or_insert_with(|| {
+        SymbolReachability::with_observability(source_type, scoping.scoping(), allocator)
+    });
+    declaration.bound_names(&mut |ident| {
+        if let Some(symbol_id) = ident.symbol_id.get() {
+            reachability.mark_observable_without_resolved_references(symbol_id);
+        }
+    });
+}
+
 /// Normalize hook: record runtime bindings exposed by a named export.
 pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut TraverseCtx<'_>) {
     let TraverseCtx { state, scoping, .. } = ctx;
@@ -391,7 +433,7 @@ pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut
     {
         inner.bound_names(&mut |ident| {
             if let Some(symbol_id) = ident.symbol_id.get() {
-                reachability.mark_externally_observable(symbol_id);
+                reachability.mark_observable_without_resolved_references(symbol_id);
             }
         });
     }
@@ -411,7 +453,7 @@ pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut
             (!reference.flags().is_type_only()).then(|| reference.symbol_id()).flatten()
         };
         if let Some(symbol_id) = symbol_id {
-            reachability.mark_externally_observable(symbol_id);
+            reachability.mark_observable_without_resolved_references(symbol_id);
         }
     }
 }
@@ -435,7 +477,7 @@ pub fn register_default_export(
     if let Some(symbol_id) = symbol_id
         && let Some(reachability) = &mut ctx.state.symbol_reachability
     {
-        reachability.mark_externally_observable(symbol_id);
+        reachability.mark_observable_without_resolved_references(symbol_id);
     }
 }
 
@@ -447,6 +489,9 @@ pub fn register_default_export(
 /// edge or root. Scope-only rewrites preserve the nearest function owner.
 pub fn dead_references_affect_analysis(ctx: &TraverseCtx<'_>) -> bool {
     let Some(reachability) = &ctx.state.symbol_reachability else { return false };
+    if reachability.functions.is_none() {
+        return false;
+    }
     ctx.state.dirty.dead_refs.ones().any(|bit| {
         ctx.scoping()
             .get_reference(ReferenceId::from_usize(bit))

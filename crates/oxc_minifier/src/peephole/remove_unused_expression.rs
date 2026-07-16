@@ -777,8 +777,9 @@ impl<'a> PeepholeOptimizations {
         if ctx.scoping().symbol_flags(symbol_id).is_const_variable() {
             return false;
         }
-        // Cannot remove assignment to live bindings: `export let foo; foo = 1;`.
-        if ctx.state.symbol_is_externally_observable(symbol_id) {
+        // Cannot remove writes to bindings observed without resolved references,
+        // for example `export let foo; foo = 1;`.
+        if ctx.state.symbol_is_observable_without_resolved_references(symbol_id) {
             return false;
         }
         let Some(symbol_value) = ctx.state.symbol_values.get_symbol_value(symbol_id) else {
@@ -971,7 +972,7 @@ impl<'a> PeepholeOptimizations {
     /// Four conditions must hold:
     /// 1. The target is a single-level member expression (`A.foo`, not `a.b.c`)
     /// 2. ALL references to the symbol are member write targets
-    /// 3. The symbol creates a fresh value (not an alias) and is not exported
+    /// 3. The symbol creates a fresh value and is not otherwise observable
     /// 4. No `__proto__` write may have installed a setter that another
     ///    reference could trigger
     fn is_member_assign_to_unused_binding(symbol_id: SymbolId, ctx: &TraverseCtx<'a>) -> bool {
@@ -987,8 +988,9 @@ impl<'a> PeepholeOptimizations {
             return false;
         }
 
-        // Check: symbol creates a fresh value (not an alias) and is not exported.
-        if ctx.state.symbol_is_externally_observable(symbol_id) {
+        // Check: symbol creates a fresh value and is not observable without
+        // resolved references.
+        if ctx.state.symbol_is_observable_without_resolved_references(symbol_id) {
             return false;
         }
         let Some(sv) = ctx.state.symbol_values.get_symbol_value(symbol_id) else {

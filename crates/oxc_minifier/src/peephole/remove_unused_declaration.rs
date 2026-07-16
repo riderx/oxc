@@ -12,10 +12,10 @@ impl<'a> PeepholeOptimizations {
     }
 
     /// Count-based unusedness shared by declarations, assignments, member
-    /// writes, IIFE folding, and single-use substitution. Module exports make
-    /// a binding observable even with no references inside this module.
+    /// writes, IIFE folding, and single-use substitution. Some runtime
+    /// semantics can observe a binding even with no resolved references.
     pub(super) fn symbol_is_unused_by_count(symbol_id: SymbolId, ctx: &TraverseCtx<'a>) -> bool {
-        !ctx.state.symbol_is_externally_observable(symbol_id)
+        !ctx.state.symbol_is_observable_without_resolved_references(symbol_id)
             && ctx.scoping().symbol_is_unused(symbol_id)
     }
 
@@ -47,7 +47,7 @@ impl<'a> PeepholeOptimizations {
             return false;
         };
 
-        if ctx.state.symbol_is_externally_observable(symbol_id)
+        if ctx.state.symbol_is_observable_without_resolved_references(symbol_id)
             || (ctx.source_type().is_script()
                 && ctx.scoping().symbol_scope_id(symbol_id) == ctx.scoping().root_scope_id())
         {

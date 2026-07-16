@@ -3,8 +3,7 @@ use rustc_hash::FxHashSet;
 
 use oxc_allocator::Allocator;
 use oxc_codegen::Codegen;
-use oxc_minifier::CompressOptions;
-use oxc_minifier::Compressor;
+use oxc_minifier::{CompressOptions, Compressor, TreeShakeOptions};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -52,7 +51,16 @@ fn test_same_source_type(source_text: &str, source_type: SourceType) {
 
 #[track_caller]
 fn test_with_options(source_text: &str, expected: &str, options: CompressOptions) {
-    let source_type = SourceType::default();
+    test_with_options_source_type(source_text, expected, SourceType::default(), options);
+}
+
+#[track_caller]
+fn test_with_options_source_type(
+    source_text: &str,
+    expected: &str,
+    source_type: SourceType,
+    options: CompressOptions,
+) {
     let result = run(source_text, source_type, Some(options));
     let expected = run(expected, source_type, None);
     assert_eq!(result, expected, "\nfor source\n{source_text}\nexpect\n{expected}\ngot\n{result}");
@@ -884,4 +892,27 @@ fn dce_keeps_script_root_var_in_nested_statement_after_cycle_removed() {
 
     // CommonJS top-level vars are wrapper-local, so ordinary counts may remove them.
     test_source_type("{ var x = 42; }", "", SourceType::cjs());
+}
+
+#[test]
+fn dce_keeps_bindings_observed_without_resolved_references() {
+    let options = CompressOptions {
+        treeshake: TreeShakeOptions {
+            property_write_side_effects: false,
+            ..TreeShakeOptions::default()
+        },
+        ..CompressOptions::dce()
+    };
+
+    let annex_source = "function outer() { { function f() {} } { function f() {} f.x = 1; function d1() { consume(f); d2() } function d2() { d1() } } console.log(f.x); } outer();";
+    let annex_expected = "function outer() { { function f() {} } { function f() {} f.x = 1; } console.log(f.x); } outer();";
+    for source_type in [SourceType::script(), SourceType::cjs()] {
+        test_with_options_source_type(annex_source, annex_expected, source_type, options.clone());
+    }
+
+    test_with_options(
+        "{ using resource = { [Symbol.dispose]() { console.log(this.x) } }; resource.x = 1; function d1() { consume(resource); d2() } function d2() { d1() } }",
+        "{ using resource = { [Symbol.dispose]() { console.log(this.x) } }; resource.x = 1; }",
+        options,
+    );
 }

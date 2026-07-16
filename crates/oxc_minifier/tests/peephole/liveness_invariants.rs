@@ -49,7 +49,9 @@ const MODULE_CASES: &[&str] = &[
     "function value() { value() } export default value",
     // Direct eval can disappear before analysis activates.
     "if (false) eval('x'); function f() { f() }",
-    // Using and for-head RHS references are ordinary roots.
+    // Using disposal observes the resource binding without a resolved read;
+    // references in its initializer and for-head RHS remain ordinary roots.
+    "{ using resource = { [Symbol.dispose]() { console.log(this.x) } }; resource.x = 1; function a() { consume(resource); b() } function b() { a() } }",
     "function f() { f() } using resource = f",
     "function f() { f() } for (var item of [f]);",
 ];
@@ -58,6 +60,7 @@ const NON_ESM_CASES: &[&str] = &[
     "function a() { b() } function b() { a() } console.log('keep')",
     "function outer() { function f() { f() } return 1 } use(outer)",
     "if (false) g(); function g() { f() } function f() { f() }",
+    "function outer() { { function f() {} } { function f() {} f.x = 1; function a() { consume(f); b() } function b() { a() } } console.log(f.x) } outer()",
 ];
 
 #[test]

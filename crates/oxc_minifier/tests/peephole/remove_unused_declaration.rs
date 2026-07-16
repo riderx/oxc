@@ -639,6 +639,16 @@ fn keep_sloppy_duplicate_block_functions() {
 }
 
 #[test]
+fn keep_sloppy_annex_b_alias_member_write_after_cycle_removed() {
+    let options = CompressOptions::smallest();
+    let source = "function outer() { { function f() {} } { function f() {} f.x = 1; function d1() { consume(f); d2() } function d2() { d1() } } console.log(f.x); } outer();";
+    let expected = "function outer() { { function f() {} } { function f() {} f.x = 1; } console.log(f.x); } outer();";
+    for source_type in [SourceType::script(), SourceType::cjs()] {
+        test_options_source_type(source, expected, source_type, &options);
+    }
+}
+
+#[test]
 fn keep_script_root_var_in_nested_statement_after_cycle_removed() {
     let options = CompressOptions::smallest();
     let source = "function outer() { function d1() { return x + d2() } function d2() { return d1() } return 1 } outer(); switch (1) { case 1: var x = 42; }";
@@ -739,6 +749,31 @@ fn keep_using_declarator_cycle() {
         "async function o() { await using u = p; var p = function() { u() }; return 1 } g(o());",
     );
     test_same_smallest("function f() {\n\tf();\n}\nusing resource = f;");
+}
+
+#[test]
+fn keep_using_member_write_observed_by_disposal() {
+    let disposer =
+        "using resource = { [Symbol.dispose]() { console.log(this.x) } }; resource.x = 1;";
+    test_same_options(
+        disposer,
+        &CompressOptions {
+            unused: CompressOptionsUnused::Keep,
+            treeshake: TreeShakeOptions {
+                property_write_side_effects: false,
+                ..TreeShakeOptions::default()
+            },
+            ..CompressOptions::smallest()
+        },
+    );
+    test_same_smallest(disposer);
+    test_same_smallest(
+        "await using resource = { [Symbol.asyncDispose]() { console.log(this.x) } }; resource.x = 1;",
+    );
+    test_smallest(
+        "{ using resource = { [Symbol.dispose]() { console.log(this.x) } }; resource.x = 1; function d1() { consume(resource); d2() } function d2() { d1() } }",
+        "{ using resource = { [Symbol.dispose]() { console.log(this.x) } }; resource.x = 1; }",
+    );
 }
 
 // Exported classes are externally observable, and references in class method
