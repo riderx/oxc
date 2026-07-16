@@ -422,6 +422,33 @@ fn keep_recursive_declarator_and_class_cycles() {
     );
 }
 
+// Future extension: the reachability graph currently admits function
+// declarations only. Keep the intended declarator behavior executable but
+// ignored until declarator sites can be analyzed and consumed safely.
+#[test]
+#[ignore = "TODO: extend recursive reachability to variable declarators"]
+fn remove_recursive_unused_declarator_cycles() {
+    test_smallest("const a = () => b(); const b = () => a();", "");
+    test_smallest("var f = function() { f() };", "");
+    test_smallest(
+        "const a = () => b(), keep = 1; function b() { a() } console.log(keep);",
+        "console.log(1);",
+    );
+    test_smallest("for (let f = () => f();;) break;", "for (;;) break;");
+}
+
+// Future extension: class evaluation needs a stable removability proof before
+// classes can participate in the graph. These are the side-effect-free shapes
+// that should become removable once that proof exists.
+#[test]
+#[ignore = "TODO: extend recursive reachability to class declarations"]
+fn remove_recursive_unused_class_cycles() {
+    test_smallest("class A { m() { new B() } } class B { m() { new A() } }", "");
+    test_smallest("function a() { b() } const b = () => { new C() }; class C { m() { a() } }", "");
+    test_smallest("function F() {} class A extends F { m() { new A() } }", "");
+    test_smallest("function F() {} class A extends (0 || F) { m() { new A() } }", "");
+}
+
 #[test]
 fn remove_recursive_unused_nested_in_live_function() {
     // Dead recursion inside a used function: statement-level tree shaking

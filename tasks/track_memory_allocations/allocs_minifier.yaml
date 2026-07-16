@@ -8,17 +8,17 @@ checker.ts:
 
 App.tsx:
   file size: 415342 # 415.34 kB
-  sys allocs: 64
+  sys allocs: 63
   sys reallocs: 8
-  arena allocs: 17033
+  arena allocs: 17029
   arena reallocs: 2702
   arena size: 2916664 # 2.92 MB
 
 RadixUIAdoptionSection.jsx:
   file size: 2520 # 2.52 kB
-  sys allocs: 22
+  sys allocs: 21
   sys reallocs: 0
-  arena allocs: 37
+  arena allocs: 33
   arena reallocs: 6
   arena size: 35800 # 35.80 kB
 

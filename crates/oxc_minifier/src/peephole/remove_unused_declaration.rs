@@ -1,17 +1,14 @@
 use super::PeepholeOptimizations;
-use crate::{CompressOptionsUnused, TraverseCtx, symbol_liveness};
+use crate::{CompressOptionsUnused, TraverseCtx};
 use oxc_ast::ast::*;
 use oxc_ecmascript::constant_evaluation::{DetermineValueType, ValueType};
 use oxc_syntax::symbol::SymbolId;
 
 impl<'a> PeepholeOptimizations {
-    /// The global gates are `symbol_liveness::removal_enabled` — one
-    /// definition shared with the liveness candidacy, so the two cannot
-    /// drift (the gate-mirror invariant; see the `symbol_liveness` module
-    /// doc).
     pub(super) fn can_remove_unused_declarators(ctx: &TraverseCtx<'a>) -> bool {
-        symbol_liveness::removal_enabled(ctx.scoping(), &ctx.state.options)
+        ctx.state.options.unused != CompressOptionsUnused::Keep
             && !Self::keep_top_level_var_in_script_mode(ctx)
+            && !ctx.scoping().root_scope_flags().contains_direct_eval()
     }
 
     /// Count-based unusedness shared by declarations, assignments, member
@@ -152,14 +149,16 @@ impl<'a> PeepholeOptimizations {
         if !Self::symbol_is_unused_by_count(symbol_id, ctx) {
             return;
         }
-        let Some(exprs) = Self::remove_unused_class(c, ctx) else { return };
-        let new_stmt = if exprs.is_empty() {
-            Statement::new_empty_statement(c.span, ctx)
-        } else {
-            let expr = Expression::new_sequence_expression(c.span, exprs, ctx);
-            Statement::new_expression_statement(c.span, expr, ctx)
-        };
-        ctx.replace_statement(stmt, new_stmt);
+        if let Some(changed) = Self::remove_unused_class(c, ctx).map(|exprs| {
+            if exprs.is_empty() {
+                Statement::new_empty_statement(c.span, ctx)
+            } else {
+                let expr = Expression::new_sequence_expression(c.span, exprs, ctx);
+                Statement::new_expression_statement(c.span, expr, ctx)
+            }
+        }) {
+            ctx.replace_statement(stmt, changed);
+        }
     }
 
     /// Do remove top level vars in script mode.

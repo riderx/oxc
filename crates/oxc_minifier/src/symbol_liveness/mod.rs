@@ -55,7 +55,7 @@
 //! functions are safe because semantic binding hoists their symbol to the
 //! observable Script root when required.
 
-use oxc_allocator::{Allocator, BitSet, Vec as ArenaVec};
+use oxc_allocator::{Allocator, BitSet, GetAllocator, Vec as ArenaVec};
 use oxc_ast::ast::*;
 #[cfg(debug_assertions)]
 use oxc_ast_visit::{Visit, walk::walk_function};
@@ -66,15 +66,6 @@ use oxc_span::SourceType;
 use oxc_syntax::{reference::ReferenceId, scope::ScopeId, symbol::SymbolId};
 
 use crate::{CompressOptions, CompressOptionsUnused, TraverseCtx};
-
-/// Whether unused-declaration removal is enabled for this program state.
-/// Any direct eval marks the root scope through ancestor propagation; once
-/// the eval is removed, `flush_pass_dirty` refreshes the flags and the next
-/// analysis can proceed.
-pub fn removal_enabled(scoping: &Scoping, options: &CompressOptions) -> bool {
-    options.unused != CompressOptionsUnused::Keep
-        && !scoping.root_scope_flags().contains_direct_eval()
-}
 
 /// Stable program-wide symbol facts plus the optional recursive-function graph.
 ///
@@ -98,8 +89,10 @@ impl<'a> SymbolReachability<'a> {
             return None;
         }
         let symbols_len = scoping.symbols_len();
-        let functions = functions_enabled.then(|| FunctionGraph::new(scoping, allocator));
-        Some(Self { externally_observable: BitSet::new_in(symbols_len, allocator), functions })
+        Some(Self {
+            externally_observable: BitSet::new_in(symbols_len, allocator),
+            functions: None,
+        })
     }
 
     #[inline]
@@ -121,6 +114,7 @@ impl<'a> SymbolReachability<'a> {
         function: &Function<'_>,
         source_type: SourceType,
         scoping: &Scoping,
+        allocator: &'a Allocator,
     ) {
         let Some(symbol_id) = function.id.as_ref().and_then(|id| id.symbol_id.get()) else {
             return;
@@ -133,7 +127,7 @@ impl<'a> SymbolReachability<'a> {
             return;
         }
 
-        let Some(graph) = &mut self.functions else { return };
+        let graph = self.functions.get_or_insert_with(|| FunctionGraph::new(scoping, allocator));
         graph.register(scope_id, symbol_id);
     }
 
@@ -346,22 +340,24 @@ pub fn register_function(function: &Function<'_>, ctx: &mut TraverseCtx<'_>) {
     if !function.is_declaration() {
         return;
     }
+    if ctx.state.options.unused == CompressOptionsUnused::Keep {
+        return;
+    }
+    let allocator = ctx.allocator();
     let TraverseCtx { state, scoping, .. } = ctx;
     if let Some(reachability) = &mut state.symbol_reachability {
-        reachability.register_function(function, state.source_type, scoping.scoping());
+        reachability.register_function(function, state.source_type, scoping.scoping(), allocator);
     }
 }
 
 /// Normalize hook: record runtime bindings exposed by a named export.
 pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut TraverseCtx<'_>) {
-    if ctx.state.symbol_reachability.is_none() {
-        return;
-    }
+    let TraverseCtx { state, scoping, .. } = ctx;
+    let Some(reachability) = &mut state.symbol_reachability else { return };
 
     if !declaration.export_kind.is_type()
         && let Some(inner) = &declaration.declaration
     {
-        let reachability = ctx.state.symbol_reachability.as_mut().unwrap();
         inner.bound_names(&mut |ident| {
             if let Some(symbol_id) = ident.symbol_id.get() {
                 reachability.mark_externally_observable(symbol_id);
@@ -380,12 +376,10 @@ pub fn register_named_export(declaration: &ExportNamedDeclaration<'_>, ctx: &mut
         let ModuleExportName::IdentifierReference(local) = &specifier.local else { continue };
         let Some(reference_id) = local.reference_id.get() else { continue };
         let symbol_id = {
-            let reference = ctx.scoping().get_reference(reference_id);
+            let reference = scoping.scoping().get_reference(reference_id);
             (!reference.flags().is_type_only()).then(|| reference.symbol_id()).flatten()
         };
-        if let Some(symbol_id) = symbol_id
-            && let Some(reachability) = &mut ctx.state.symbol_reachability
-        {
+        if let Some(symbol_id) = symbol_id {
             reachability.mark_externally_observable(symbol_id);
         }
     }
@@ -434,6 +428,9 @@ pub fn dead_references_affect_analysis(ctx: &TraverseCtx<'_>) -> bool {
 /// reference lists and publish the next dead set. Called only after
 /// `flush_pass_dirty`.
 pub fn analyze<'a>(program: &Program<'a>, ctx: &mut TraverseCtx<'a>, recompute: bool) -> bool {
+    #[cfg(not(debug_assertions))]
+    let _ = program;
+
     #[cfg(debug_assertions)]
     if let Some(dead) =
         ctx.state.symbol_reachability.as_ref().and_then(SymbolReachability::dead_functions)

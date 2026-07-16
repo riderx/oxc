@@ -101,9 +101,9 @@ pub struct MinifierState<'a> {
     mutated: bool,
 
     /// Per-pass dirty accumulator populated by `replace_*` / `drop_*` helpers
-    /// as subtrees are removed. Consumed by `flush_pass_dirty` in the
-    /// `Compressor` driver (pre-loop and after each mutated pass) to drive
-    /// the incremental scoping refresh.
+    /// as subtrees are removed. Consumed by the end-of-pass sequence after
+    /// Normalize and every peephole pass to drive the incremental scoping
+    /// refresh.
     pub(crate) dirty: PassDirty<'a>,
 
     /// Module exports and Script-global function observability plus the

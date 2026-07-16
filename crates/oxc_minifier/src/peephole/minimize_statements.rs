@@ -1086,20 +1086,19 @@ impl<'a> PeepholeOptimizations {
         if let Some(ForStatementInit::VariableDeclaration(var_decl)) = &mut for_stmt.init {
             let old_len = var_decl.declarations.len();
             var_decl.declarations.retain_mut(|decl| {
-                if !Self::should_remove_unused_declarator(decl, ctx) {
-                    return true;
+                let should_keep = !Self::should_remove_unused_declarator(decl, ctx)
+                    || decl
+                        .init
+                        .as_ref()
+                        .is_some_and(|init| Self::has_side_effects_or_preserved_iife(init, ctx));
+                if !should_keep {
+                    // Same leak hazard as `remove_unused_variable_declaration`:
+                    // the `retain` silently drops the declarator, so its refs
+                    // (init and TS type annotation) need an explicit walk to
+                    // reach `PassDirty`.
+                    ctx.drop_variable_declarator(decl);
                 }
-                if let Some(init) = &decl.init
-                    && Self::has_side_effects_or_preserved_iife(init, ctx)
-                {
-                    return true;
-                }
-                // Same leak hazard as `remove_unused_variable_declaration`:
-                // the `retain` silently drops the declarator, so its refs
-                // (init and TS type annotation) need an explicit walk to
-                // reach `PassDirty`.
-                ctx.drop_variable_declarator(decl);
-                false
+                should_keep
             });
             if old_len != var_decl.declarations.len() {
                 if var_decl.declarations.is_empty() {
@@ -1339,10 +1338,6 @@ impl<'a> PeepholeOptimizations {
     ///
     /// part of `mangleStmts`: <https://github.com/evanw/esbuild/blob/v0.25.9/internal/js_parser/js_parser.go#L9111-L9189>
     /// `substituteSingleUseSymbolInStmt`: <https://github.com/evanw/esbuild/blob/v0.25.9/internal/js_parser/js_parser.go#L9583>
-    ///
-    /// Declarators are never dead-marked under functions-only candidacy, so
-    /// any declarator init is a legal destination today; this becomes a real
-    /// caller precondition if candidacy ever widens to declarators.
     fn substitute_single_use_symbol_in_statement(
         expr_in_stmt: &mut Expression<'a>,
         stmts: &mut ArenaVec<'a, Statement<'a>>,

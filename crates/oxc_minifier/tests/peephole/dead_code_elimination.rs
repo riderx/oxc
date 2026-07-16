@@ -814,6 +814,13 @@ fn dce_recursive_unused_functions() {
 }
 
 #[test]
+#[ignore = "TODO: extend recursive reachability beyond function declarations"]
+fn dce_recursive_unused_declarators_and_classes() {
+    test("const a = () => b(); const b = () => a();", "");
+    test("class A { m() { new B() } } class B { m() { new A() } }", "");
+}
+
+#[test]
 fn dce_recursive_unused_functions_in_commonjs_and_script() {
     test_source_type(
         "function c() { d() } function d() { c() } console.log('k');",
