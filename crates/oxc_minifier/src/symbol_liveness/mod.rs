@@ -23,6 +23,30 @@
 //!    the settled resolved-reference lists, so AST rewrites need no parallel
 //!    collection hooks or behind-the-cursor repair log.
 //!
+//! ## Transform contract
+//!
+//! The graph is registered once during Normalize and recomputed only when its
+//! settled inputs can change. Peephole transforms must preserve three
+//! invariants:
+//!
+//! 1. **Do not create function declarations.** A new declaration would have no
+//!    entry in `function_by_scope` and therefore could not own references or
+//!    become a candidate. Removing an existing declaration is supported.
+//! 2. **Do not move an existing reference across function owners.** Ownership
+//!    comes from `Reference::scope_id()` and the registered function-scope
+//!    ancestors. A transform that changes the nearest owning function must
+//!    instead drop and recreate the reference, so the dirty gate requests a
+//!    new analysis.
+//! 3. **Do not create a path to a function already published as dead.** Deadness
+//!    is monotonic. Transforms may duplicate an already-live reference, but
+//!    must not make an unreachable binding reachable; debug builds assert that
+//!    a dead function never becomes live again.
+//!
+//! A transform that needs to violate one of these invariants must first extend
+//! function registration or the dirty-analysis signal. Keeping this boundary
+//! explicit is what allows the recurring traversal collector and mint log to
+//! remain removed.
+//!
 //! ES module bindings and CommonJS top-level bindings are local to their module
 //! or wrapper. Script root bindings are visible to later scripts, so root
 //! function declarations are observability-only, not graph candidates; their
